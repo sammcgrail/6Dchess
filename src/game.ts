@@ -36,6 +36,7 @@ import {
   scoreMultiverseMove,
 } from './rules';
 import { stockfish } from './stockfish';
+import { sound } from './sound';
 
 class GameManager {
   private timelines: Record<number, TimelineData> = {};
@@ -57,7 +58,24 @@ class GameManager {
   private _lastTimelineStructure = '';
 
 
+  private _setupSoundToggle(): void {
+    const btn = document.getElementById('sound-toggle');
+    if (!btn) return;
+    const sync = () => {
+      btn.classList.toggle('muted', sound.muted);
+      btn.title = sound.muted ? 'Sound off (click to unmute)' : 'Sound on (click to mute)';
+      btn.setAttribute('aria-pressed', String(!sound.muted));
+    };
+    btn.addEventListener('click', () => {
+      sound.setMuted(!sound.muted);
+      sync();
+      if (!sound.muted) sound.play('move');
+    });
+    sync();
+  }
+
   init(): void {
+    this._setupSoundToggle();
     Board3D.init('scene-container', (info) => this.handleClick(info));
 
     const resetBtn = document.getElementById('reset');
@@ -1193,6 +1211,7 @@ timelines - list timelines`,
     this.clearSelection();
     this.renderTimeline(tlId);
     col?.animatePieceMove(move.from, move.to);
+    sound.play(chess.in_check() ? 'check' : result.captured ? 'capture' : 'move');
     this._afterMove();
     return true;
   }
@@ -1321,6 +1340,7 @@ timelines - list timelines`,
     this.clearSelection();
     this.renderTimeline(sourceTimelineId);
     this.renderTimeline(targetTimelineId);
+    sound.play('portal');
     this._afterMove();
     return true;
   }
@@ -1456,6 +1476,7 @@ timelines - list timelines`,
     this.setActiveTimeline(newId, shouldFocus);
     this.renderTimeline(sourceTimelineId);
     this.renderTimeline(newId);
+    sound.play('portal');
     this._afterMove();
 
     Board3D.spawnPortalEffect(newId, sourceSquare);
@@ -1959,6 +1980,7 @@ timelines - list timelines`,
    * Handle game end - zoom out to show all boards and display stats toast.
    */
   private _handleGameEnd(): void {
+    sound.play('end');
     // Zoom out camera to show all boards
     Board3D.zoomOutShowAll();
 

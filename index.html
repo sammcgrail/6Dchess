@@ -14,7 +14,7 @@
     </script>
     <title>6D Chess</title>
     <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>♟️</text></svg>">
-    <link rel="stylesheet" href="css/style.css?v=fc431ae946">
+    <link rel="stylesheet" href="css/style.css?v=2ed17a143a">
 </head>
 <body>
     <div id="app">
@@ -23,7 +23,7 @@
             <div id="sidebar-resize"></div>
             <header id="sidebar-header">
                 <div class="brand"><span class="brand-mark" aria-hidden="true">♞</span>6D Chess</div>
-                <span class="brand-tag">multiverse</span>
+                <button id="sound-toggle" class="sound-toggle" aria-label="Toggle sound"><svg class="icon on" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 5 6 9H2v6h4l5 4V5z"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg><svg class="icon off" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 5 6 9H2v6h4l5 4V5z"/><line x1="22" y1="9" x2="16" y2="15"/><line x1="16" y1="9" x2="22" y2="15"/></svg></button>
             </header>
             <div id="status" role="status" aria-live="polite">White to move</div>
             <div id="fen-display" title="Click to copy FEN">
@@ -145,6 +145,6 @@
     <script src="lib/OrbitControls.js"></script>
     <!-- Stockfish chess engine loads via Web Worker from lib/stockfish-worker.js -->
     <!-- TypeScript compiled bundle (with cache buster) -->
-    <script src="dist/bundle.js?v=8b3ee9920c"></script>
+    <script src="dist/bundle.js?v=c3dc8f8a07"></script>
 </body>
 </html>

@@ -1792,3 +1792,34 @@ summary:focus-visible {
         transition-duration: 0.01ms !important;
     }
 }
+
+#sidebar-header {
+    align-items: center;
+}
+
+.sound-toggle {
+    background: transparent;
+    border: 1px solid var(--panel-border);
+    color: var(--text-dim);
+    border-radius: 8px;
+    width: 30px;
+    height: 28px;
+    display: grid;
+    place-items: center;
+    cursor: pointer;
+    transition: color 0.15s, border-color 0.15s;
+}
+
+.sound-toggle:hover {
+    color: var(--text);
+    border-color: rgba(140, 140, 220, 0.4);
+}
+
+.sound-toggle .off,
+.sound-toggle.muted .on {
+    display: none;
+}
+
+.sound-toggle.muted .off {
+    display: block;
+}

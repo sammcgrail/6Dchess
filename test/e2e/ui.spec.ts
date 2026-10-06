@@ -85,3 +85,18 @@ test('real mouse clicks on the 3D board select and move pieces', async ({ page }
   expect(fen.split(' ')[0]).toBe('rnbqkb1r/pppppppp/5n2/8/4P3/8/PPPP1PPP/RNBQKBNR');
   expect(errors).toEqual([]);
 });
+
+test('sound toggle persists across reloads', async ({ page }) => {
+  const errors = collectErrors(page);
+  await openGame(page);
+  const toggle = page.locator('#sound-toggle');
+  await expect(toggle).toHaveAttribute('aria-pressed', 'true');
+  await toggle.click();
+  await expect(toggle).toHaveAttribute('aria-pressed', 'false');
+  await page.reload();
+  await openGame(page);
+  await expect(page.locator('#sound-toggle')).toHaveAttribute('aria-pressed', 'false');
+  // Moves still work with audio muted / unavailable
+  await move(page, 0, 'e2', 'e4');
+  expect(errors).toEqual([]);
+});
