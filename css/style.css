@@ -1364,15 +1364,6 @@ body::-webkit-scrollbar {
     color: #66aa66;
 }
 
-#ghost-counter {
-    color: #666688;
-    cursor: help;
-}
-
-#ghost-counter.active {
-    color: #ff8866;
-}
-
 #version-info {
     color: #8888aa;
     transition: color 0.2s;

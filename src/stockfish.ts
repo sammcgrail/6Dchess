@@ -17,20 +17,26 @@ export interface StockfishMove {
 export class StockfishManager {
   private worker: Worker | null = null;
   private isReady = false;
-  private isLoading = false;
-  private pendingResolve: ((move: StockfishMove | null) => void) | null = null;
+  private loadPromise: Promise<boolean> | null = null;
+  private resolveUciOk: (() => void) | null = null;
   private _skillLevel = 10; // 0-20, default middle
   private _searchDepth = 10; // 1-20, default reasonable depth
   private _onReadyCallbacks: (() => void)[] = [];
 
+  // Only one search runs at a time; later requests wait in this chain
+  private searchQueue: Promise<unknown> = Promise.resolve();
+  private activeSearch: { resolve: (move: StockfishMove | null) => void; timer: ReturnType<typeof setTimeout> } | null = null;
+  // Aborted searches still emit a "bestmove"; this many must be discarded
+  private staleBestmoves = 0;
+
+  /** Hard cap on engine thinking time per move */
+  static readonly MOVE_TIME_MS = 4000;
+
   constructor() {
-    // Load Stockfish on construction
     this.loadEngine();
   }
 
-  /**
-   * Register a callback to be called when the engine becomes ready
-   */
+  /** Register a callback to be called when the engine becomes ready */
   onReady(callback: () => void): void {
     if (this.isReady) {
       callback();
@@ -39,9 +45,6 @@ export class StockfishManager {
     }
   }
 
-  /**
-   * Notify all registered callbacks that the engine is ready
-   */
   private _notifyReady(): void {
     for (const cb of this._onReadyCallbacks) {
       try {
@@ -53,129 +56,78 @@ export class StockfishManager {
     this._onReadyCallbacks = [];
   }
 
-  /**
-   * Load the Stockfish engine as a Web Worker with proper WASM path resolution
-   */
-  async loadEngine(): Promise<boolean> {
-    if (this.worker) {
-      return true;
-    }
+  /** Load the Stockfish engine as a Web Worker. Resolves true once the engine has answered "uciok". */
+  loadEngine(): Promise<boolean> {
+    if (this.isReady) return Promise.resolve(true);
+    if (this.loadPromise) return this.loadPromise;
 
-    if (this.isLoading) {
-      // Wait for existing load to complete
-      return new Promise((resolve) => {
-        const checkReady = setInterval(() => {
-          if (this.isReady) {
-            clearInterval(checkReady);
-            resolve(true);
-          } else if (!this.isLoading && !this.worker) {
-            clearInterval(checkReady);
-            resolve(false);
-          }
-        }, 100);
-      });
-    }
-
-    this.isLoading = true;
-
-    try {
-      // Create the worker using the wrapper script that handles WASM path resolution
-      // The wrapper script uses self.location.href to determine the base URL
-      // which works correctly when loaded from a direct file path
-      const workerUrl = new URL('lib/stockfish-worker.js', window.location.href).href;
-      console.log('[Stockfish] Creating worker from:', workerUrl);
-
-      this.worker = new Worker(workerUrl);
-
-      // Setup message handler
-      this.worker.onmessage = (e) => this.handleMessage(String(e.data));
-
-      this.worker.onerror = (err) => {
-        console.error('[Stockfish] Worker error:', err);
+    this.loadPromise = new Promise<boolean>((resolve) => {
+      let settled = false;
+      const finish = (ok: boolean, error?: unknown) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        this.resolveUciOk = null;
+        if (ok) {
+          this.isReady = true;
+          this.setSkillLevel(this._skillLevel);
+          this._notifyReady();
+        } else {
+          console.warn('[Stockfish] Engine unavailable, CPU will use its built-in move picker:', error);
+          this.worker?.terminate();
+          this.worker = null;
+          this.loadPromise = null;
+        }
+        resolve(ok);
       };
+      const timeout = setTimeout(() => finish(false, new Error('UCI timeout')), 15000);
 
-      // Initialize UCI
-      this.worker.postMessage('uci');
-
-      // Wait for uciok
-      await new Promise<void>((resolve, reject) => {
-        const timeout = setTimeout(() => {
-          reject(new Error('Stockfish UCI timeout'));
-        }, 10000); // 10s timeout for loading WASM
-
-        const checkReady = setInterval(() => {
-          if (this.isReady) {
-            clearInterval(checkReady);
-            clearTimeout(timeout);
-            resolve();
-          }
-        }, 50);
-      });
-
-      // Set default skill level
-      this.setSkillLevel(this._skillLevel);
-
-      console.log('[Stockfish] Engine loaded and ready');
-      this.isLoading = false;
-
-      // Notify any registered callbacks
-      this._notifyReady();
-
-      return true;
-    } catch (error) {
-      console.error('[Stockfish] Failed to load engine:', error);
-      this.worker?.terminate();
-      this.worker = null;
-      this.isLoading = false;
-      return false;
-    }
-  }
-
-  /**
-   * Handle UCI messages from the engine
-   */
-  private handleMessage(msg: string): void {
-    // console.log('[Stockfish] Message:', msg);
-
-    if (msg === 'uciok') {
-      this.isReady = true;
-    } else if (msg.startsWith('bestmove')) {
-      // Parse bestmove response: "bestmove e2e4 ponder d7d5"
-      const parts = msg.split(' ');
-      if (parts.length >= 2 && parts[1] !== '(none)') {
-        const moveStr = parts[1];
-        const move = this.parseMoveString(moveStr);
-        if (this.pendingResolve) {
-          this.pendingResolve(move);
-          this.pendingResolve = null;
-        }
-      } else {
-        // No legal move (shouldn't happen in normal play)
-        if (this.pendingResolve) {
-          this.pendingResolve(null);
-          this.pendingResolve = null;
-        }
+      try {
+        // Resolve against <base href> so the worker loads from the app directory
+        const workerUrl = new URL('lib/stockfish-worker.js', document.baseURI).href;
+        this.worker = new Worker(workerUrl);
+        this.worker.onmessage = (e) => this.handleMessage(String(e.data));
+        this.worker.onerror = (err) => finish(false, err.message || err);
+        this.resolveUciOk = () => finish(true);
+        this.worker.postMessage('uci');
+      } catch (error) {
+        finish(false, error);
       }
-    }
+    });
+    return this.loadPromise;
   }
 
-  /**
-   * Parse a UCI move string like "e2e4" or "e7e8q" to StockfishMove
-   */
+  /** Handle UCI messages from the engine */
+  private handleMessage(msg: string): void {
+    if (msg === 'uciok') {
+      this.resolveUciOk?.();
+      return;
+    }
+    if (!msg.startsWith('bestmove')) return;
+
+    if (this.staleBestmoves > 0) {
+      this.staleBestmoves--;
+      return;
+    }
+    const search = this.activeSearch;
+    if (!search) return;
+    this.activeSearch = null;
+    clearTimeout(search.timer);
+    // "bestmove e2e4 ponder d7d5" or "bestmove (none)"
+    const moveStr = msg.split(' ')[1];
+    search.resolve(moveStr && moveStr !== '(none)' ? this.parseMoveString(moveStr) : null);
+  }
+
+  /** Parse a UCI move string like "e2e4" or "e7e8q" */
   private parseMoveString(moveStr: string): StockfishMove | null {
     if (moveStr.length < 4) return null;
-
     const from = moveStr.substring(0, 2) as Square;
     const to = moveStr.substring(2, 4) as Square;
     const promotion = moveStr.length > 4 ? moveStr.charAt(4) : undefined;
-
     return { from, to, promotion };
   }
 
-  /**
-   * Set the engine skill level (0-20)
-   * 0 = weakest, 20 = strongest
-   */
+  /** Set the engine skill level (0 = weakest, 20 = strongest) */
   setSkillLevel(level: number): void {
     this._skillLevel = Math.max(0, Math.min(20, level));
     if (this.worker && this.isReady) {
@@ -187,9 +139,7 @@ export class StockfishManager {
     return this._skillLevel;
   }
 
-  /**
-   * Set the search depth (1-20)
-   */
+  /** Set the search depth (1-20) */
   setSearchDepth(depth: number): void {
     this._searchDepth = Math.max(1, Math.min(20, depth));
   }
@@ -198,89 +148,66 @@ export class StockfishManager {
     return this._searchDepth;
   }
 
-  /**
-   * Check if the engine is available and ready
-   */
+  /** Check if the engine is available and ready */
   get available(): boolean {
     return this.worker !== null && this.isReady;
   }
 
   /**
-   * Get the best move for a given position (FEN)
-   * @param fen - The position in FEN notation
-   * @param depth - Optional search depth override (uses instance depth if not specified)
-   * @returns Promise<StockfishMove | null> - The best move or null if unavailable
+   * Get the best move for a given position (FEN). Requests are serialized, so
+   * each result always belongs to the position it was asked for.
    */
-  async getBestMove(fen: string, depth?: number): Promise<StockfishMove | null> {
-    if (!this.worker || !this.isReady) {
-      // Try to load engine if not ready
-      const loaded = await this.loadEngine();
-      if (!loaded) {
-        console.warn('[Stockfish] Engine not available, returning null');
-        return null;
-      }
-    }
-
-    // Use provided depth or instance depth
+  getBestMove(fen: string, depth?: number): Promise<StockfishMove | null> {
     const searchDepth = depth ?? this._searchDepth;
+    const result = this.searchQueue.then(() => this._search(fen, searchDepth));
+    this.searchQueue = result.catch(() => null);
+    return result;
+  }
 
+  private async _search(fen: string, depth: number): Promise<StockfishMove | null> {
+    if (!(await this.loadEngine()) || !this.worker) return null;
     return new Promise((resolve) => {
-      // Set up a timeout in case engine hangs
-      const timeout = setTimeout(() => {
+      const timer = setTimeout(() => {
         console.warn('[Stockfish] Search timed out');
-        this.pendingResolve = null;
-        this.worker?.postMessage('stop');
-        resolve(null);
-      }, 10000); // 10 second timeout
-
-      this.pendingResolve = (move) => {
-        clearTimeout(timeout);
-        resolve(move);
-      };
-
-      // Send position and search command
+        this._abortActiveSearch();
+      }, StockfishManager.MOVE_TIME_MS + 5000);
+      this.activeSearch = { resolve, timer };
       this.worker!.postMessage(`position fen ${fen}`);
-      this.worker!.postMessage(`go depth ${searchDepth}`);
+      this.worker!.postMessage(`go depth ${depth} movetime ${StockfishManager.MOVE_TIME_MS}`);
     });
   }
 
-  /**
-   * Stop any ongoing search
-   */
-  stop(): void {
-    if (this.worker) {
-      this.worker.postMessage('stop');
-      if (this.pendingResolve) {
-        this.pendingResolve(null);
-        this.pendingResolve = null;
-      }
-    }
+  /** Abort the running search; its late "bestmove" will be discarded */
+  private _abortActiveSearch(): void {
+    const search = this.activeSearch;
+    if (!search) return;
+    this.activeSearch = null;
+    clearTimeout(search.timer);
+    this.staleBestmoves++;
+    this.worker?.postMessage('stop');
+    search.resolve(null);
   }
 
-  /**
-   * Reset the engine for a new game
-   */
+  /** Stop any ongoing search */
+  stop(): void {
+    this._abortActiveSearch();
+  }
+
+  /** Reset the engine for a new game */
   newGame(): void {
     if (this.worker && this.isReady) {
       this.worker.postMessage('ucinewgame');
     }
   }
 
-  /**
-   * Terminate the worker completely (for page unload cleanup)
-   */
+  /** Terminate the worker completely (for page unload cleanup) */
   terminate(): void {
-    if (this.worker) {
-      console.log('[Stockfish] Terminating worker');
-      this.worker.terminate();
-      this.worker = null;
-      this.isReady = false;
-      this.isLoading = false;
-      if (this.pendingResolve) {
-        this.pendingResolve(null);
-        this.pendingResolve = null;
-      }
-    }
+    this._abortActiveSearch();
+    this.worker?.terminate();
+    this.worker = null;
+    this.isReady = false;
+    this.loadPromise = null;
+    this.staleBestmoves = 0;
   }
 }
 

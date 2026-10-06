@@ -3,8 +3,8 @@
 // THREE.js is loaded from CDN as a global - we just use the types from @types/three
 import type {
   Scene, PerspectiveCamera, WebGLRenderer, Raycaster, Vector2, Vector3, Clock,
-  Group, Mesh, Sprite, Points, Material, MeshStandardMaterial, MeshBasicMaterial, SpriteMaterial,
-  Texture, Object3D, BufferAttribute, Color, BoxGeometry, Curve, BufferGeometry
+  Group, Mesh, Sprite, Points, Material, MeshStandardMaterial, SpriteMaterial,
+  Texture, Object3D, Curve, BufferGeometry
 } from 'three';
 
 import type {
@@ -45,23 +45,45 @@ declare const THREE: typeof import('three') & {
 // Module-level constants - accessible to all classes in this file
 // ===============================================================
 
-// Debug mode for piece overlap investigation
-// Set to true to enable detailed render logging
-const DEBUG_MODE = true;
+// One SpriteMaterial per piece texture, shared by every sprite showing that piece
+const pieceMaterialCache = new Map<Texture, SpriteMaterial>();
 
-// Session-wide ghost removal counter
-// Tracks MANDATORY_SYNC removals across all Board3D instances
-let sessionGhostRemovalCount = 0;
+// Board coordinate labels are identical on every board, so share them
+const labelMaterialCache = new Map<string, SpriteMaterial>();
 
-// Update the ghost counter display in the UI
-function updateGhostCounterDisplay(): void {
-  const ghostCounterEl = document.getElementById('ghost-counter');
-  if (ghostCounterEl) {
-    ghostCounterEl.textContent = sessionGhostRemovalCount > 0 ? `G:${sessionGhostRemovalCount}` : '0';
-    if (sessionGhostRemovalCount > 0) {
-      ghostCounterEl.classList.add('active');
-    }
+const BLACK = new THREE.Color(0x000000);
+const CHECKMATE_GLOW = new THREE.Color(0xff3333);
+const DRAW_GLOW = new THREE.Color(0xffa500);
+
+/** Free GPU resources of an object tree whose geometries and materials are not shared (e.g. glow tubes) */
+function disposeTree(root: Object3D): void {
+  root.traverse((obj: Object3D) => {
+    const mesh = obj as Mesh;
+    mesh.geometry?.dispose();
+    const mat = mesh.material as Material | Material[] | undefined;
+    if (Array.isArray(mat)) mat.forEach((m) => m.dispose());
+    else mat?.dispose();
+  });
+}
+
+/** Remove and dispose every child of a group */
+function clearGroup(group: Group): void {
+  while (group.children.length) {
+    const child = group.children[group.children.length - 1];
+    group.remove(child);
+    disposeTree(child);
   }
+}
+
+/** Set a glow tube's opacity scale; each material remembers its base opacity from _glowTube */
+function setTubeOpacity(tube: Object3D, scale: number): void {
+  tube.userData.opacityScale = scale;
+  tube.traverse((obj: Object3D) => {
+    const mat = (obj as Mesh).material as Material | undefined;
+    if (mat && mat.userData.baseOpacity !== undefined) {
+      mat.opacity = mat.userData.baseOpacity * scale;
+    }
+  });
 }
 
 // ===============================================================
@@ -292,6 +314,8 @@ class MeshPool {
     const pool = this.pools.get(type);
     if (pool && pool.length > 0) {
       const mesh = pool.pop()!;
+      mesh.geometry = geometry;
+      mesh.material = material;
       mesh.visible = true;
       return mesh;
     }
@@ -338,136 +362,28 @@ const meshPool = new MeshPool();
 
 interface PooledSprite extends Sprite {
   _pooled?: boolean;
-  _spriteId?: number;  // Unique ID for tracking sprite lifecycle
 }
 
+/** Reuses piece sprites. Materials are shared (see pieceMaterialCache) and never disposed here. */
 class SpritePool {
   private pool: PooledSprite[] = [];
-  private maxPoolSize = 128;  // Enough for 4 boards worth of pieces
-  private static readonly WARNING_THRESHOLD = 64;  // Log when pool exceeds this
-  private _totalCreated = 0;  // Track total sprites ever created for monitoring
-  private _nextSpriteId = 1;  // Monotonically increasing ID for tracking
+  private maxPoolSize = 256;
 
-  /** Get a sprite from the pool or create a new one */
   acquire(material: SpriteMaterial): PooledSprite {
-    if (this.pool.length > 0) {
-      const sprite = this.pool.pop()!;
-      sprite.visible = true;
-      // Update material - dispose old one and assign new
-      if (sprite.material && sprite.material !== material) {
-        (sprite.material as SpriteMaterial).dispose();
-      }
-      sprite.material = material;
-
-      if (DEBUG_MODE) {
-        console.log(`[SpritePool] ACQUIRE reused sprite id=${sprite._spriteId}`);
-      }
-      return sprite;
-    }
-    const sprite = new THREE.Sprite(material) as PooledSprite;
+    const sprite = this.pool.pop() ?? (new THREE.Sprite(material) as PooledSprite);
     sprite._pooled = true;
-    sprite.frustumCulled = true;
-    sprite._spriteId = this._nextSpriteId++;
-    this._totalCreated++;
-
-    if (DEBUG_MODE) {
-      console.log(`[SpritePool] ACQUIRE new sprite id=${sprite._spriteId} (total created: ${this._totalCreated})`);
-    }
-
-    // Monitor: warn if we've created many sprites (potential memory leak indicator)
-    if (this._totalCreated > 0 && this._totalCreated % 100 === 0) {
-      console.warn('[SpritePool] Created', this._totalCreated, 'sprites total. Pool size:', this.pool.length);
-    }
-
+    sprite.material = material;
+    sprite.visible = true;
     return sprite;
   }
 
-  /** Return a sprite to the pool */
   release(sprite: PooledSprite): void {
-    const spriteId = sprite._spriteId ?? 'unknown';
-    const hadParent = !!sprite.parent;
-
-    // v0.1.77 FIX: Always remove from parent first, even for non-pooled sprites
-    // This ensures ghost sprites are removed from scene regardless of pool status
-    if (sprite.parent) {
-      sprite.parent.remove(sprite);
-    }
+    sprite.parent?.remove(sprite);
     sprite.visible = false;
-
-    if (DEBUG_MODE) {
-      console.log(`[SpritePool] RELEASE sprite id=${spriteId} hadParent=${hadParent} pos=(${sprite.position.x.toFixed(2)},${sprite.position.y.toFixed(2)},${sprite.position.z.toFixed(2)})`);
-    }
-
-    // Non-pooled sprites: log warning and dispose (they won't be reused)
-    if (!sprite._pooled) {
-      console.warn('[SpritePool] NON_POOLED_SPRITE: Removing sprite that was not created via pool. This may indicate a bug in sprite creation.', {
-        spriteId,
-        hasParent: hadParent,
-        position: sprite.position ? { x: sprite.position.x, y: sprite.position.y, z: sprite.position.z } : null,
-      });
-      // Dispose the material since we can't reuse this sprite
-      if (sprite.material) {
-        (sprite.material as SpriteMaterial).dispose();
-      }
-      return;
-    }
-
-    if (this.pool.length < this.maxPoolSize) {
-      this.pool.push(sprite);
-    } else {
-      // Pool is full - dispose this sprite
-      if (sprite.material) {
-        (sprite.material as SpriteMaterial).dispose();
-      }
-    }
-
-    // Monitor: warn if pool grows beyond expected size
-    if (this.pool.length > SpritePool.WARNING_THRESHOLD && this.pool.length % 16 === 0) {
-      console.warn('[SpritePool] Pool size exceeds threshold:', this.pool.length, '/', this.maxPoolSize);
-    }
+    if (this.pool.length < this.maxPoolSize) this.pool.push(sprite);
   }
 
-  /**
-   * Trim the pool to reduce memory usage.
-   * Destroys excess sprites if pool size exceeds the target.
-   * Call periodically (e.g., after major state changes) to prevent unbounded growth.
-   *
-   * @param targetSize - Target pool size to trim to (default: half of max)
-   */
-  trim(targetSize?: number): void {
-    const target = targetSize ?? Math.floor(this.maxPoolSize / 2);
-    let trimmed = 0;
-
-    while (this.pool.length > target) {
-      const sprite = this.pool.pop();
-      if (sprite?.material) {
-        (sprite.material as SpriteMaterial).dispose();
-      }
-      trimmed++;
-    }
-
-    if (trimmed > 0) {
-      console.log('[SpritePool] Trimmed', trimmed, 'sprites. Pool size now:', this.pool.length);
-    }
-  }
-
-  /** Get current pool size (for monitoring) */
-  size(): number {
-    return this.pool.length;
-  }
-
-  /** Get total sprites created (for monitoring memory leaks) */
-  totalCreated(): number {
-    return this._totalCreated;
-  }
-
-  /** Clear all pooled sprites */
   clear(): void {
-    for (const sprite of this.pool) {
-      if (sprite.material) {
-        (sprite.material as SpriteMaterial).dispose();
-      }
-    }
     this.pool = [];
   }
 }
@@ -486,6 +402,8 @@ export class TimelineCol implements ITimelineCol {
   // These MUST be different to prevent visual overlap
   static readonly MAIN_PIECE_Y = 0.22;
   static readonly HISTORY_PIECE_Y = 0.12;
+  static readonly PIECE_SCALE_3D = 0.88;
+  static readonly PIECE_SCALE_2D = 1.25;
   // Board bounds for piece position validation (8x8 board centered at origin).
   // Pieces are placed at positions col-3.5 (from -3.5 to 3.5), but we use
   // slightly wider bounds (-4 to 4) to account for floating-point tolerance.
@@ -497,14 +415,11 @@ export class TimelineCol implements ITimelineCol {
   private shared: SharedResources;
   id: number;
   xOffset: number;
-  private tint: number;
-  private _texCache: TextureCache;
   private _pieceChars: PieceCharMap;
   private _pieceTex: (char: string, isWhite: boolean) => Texture;
 
   group: Group;
   private squareMeshes: Mesh[] = [];
-  private pieceMeshes: Sprite[] = [];
   private highlightMeshes: HighlightEntry[] = [];
   private lastMoveHL: Mesh[] = [];
   historyLayers: Group[] = [];  // Public for branch line rebuilding
@@ -515,22 +430,20 @@ export class TimelineCol implements ITimelineCol {
   private timeTravelTargets: Mesh[] = [];     // Cyan-green portals for time travel moves
   private drawnBranchIndices: Set<number> = new Set();  // Track which snapshot indices have branches drawn
   private _is2DMode = false;  // Track if 2D mode is active (hide history layers)
-  private _debugLabel: Sprite | null = null;  // Reference to debug label for hiding in 2D mode
+  // Per-board clones of the base/trim materials so active/highlight glow affects only this board
+  private baseMat: MeshStandardMaterial;
+  private trimMat: MeshStandardMaterial;
 
   // Performance: track previous board state for diff-based rendering
   // Store as map of "row,col" -> "type,color" to detect what changed
   private _prevBoardState: Map<string, string> = new Map();
   // Map sprite position key to the sprite at that position for efficient updates
   private _spriteMap: Map<string, Sprite> = new Map();
-  // Debug: track if render is currently executing to detect reentrant calls
-  private _renderInProgress = false;
 
   constructor(
     scene: Scene,
     id: number,
     xOffset: number,
-    tintColor: number,
-    texCache: TextureCache,
     pieceChars: PieceCharMap,
     pieceTex: (char: string, isWhite: boolean) => Texture
   ) {
@@ -538,13 +451,13 @@ export class TimelineCol implements ITimelineCol {
     this.shared = SharedResources.getInstance();
     this.id = id;
     this.xOffset = xOffset;
-    this.tint = tintColor;
-    this._texCache = texCache;
     this._pieceChars = pieceChars;
     this._pieceTex = pieceTex;
 
     this.group = new THREE.Group();
     this.group.position.x = xOffset;
+    this.baseMat = this.shared.boardBaseMat!.clone();
+    this.trimMat = this.shared.boardTrimMat!.clone();
 
     this.moveLineGroup = new THREE.Group();
     this.interLayerGroup = new THREE.Group();
@@ -552,11 +465,9 @@ export class TimelineCol implements ITimelineCol {
     this.group.add(this.interLayerGroup);
 
     this._buildBoard();
-    this._addDebugPositionLabel();
     scene.add(this.group);
 
     // Log timeline creation with position
-    console.log(`[Board3D] Timeline ${id} created at xOffset=${xOffset}`);
   }
 
   private _toSq(r: number, c: number): string {
@@ -601,19 +512,13 @@ export class TimelineCol implements ITimelineCol {
   /* board base + squares */
   private _buildBoard(): void {
     // Base board - using shared geometry and material
-    const base = new THREE.Mesh(
-      this.shared.boardBaseGeometry!,
-      this.shared.boardBaseMat!
-    );
+    const base = new THREE.Mesh(this.shared.boardBaseGeometry!, this.baseMat);
     base.position.y = -0.16;
     base.receiveShadow = true;
     base.frustumCulled = true;
     this.group.add(base);
 
-    const trim = new THREE.Mesh(
-      this.shared.boardTrimGeometry!,
-      this.shared.boardTrimMat!
-    );
+    const trim = new THREE.Mesh(this.shared.boardTrimGeometry!, this.trimMat);
     trim.position.y = -0.28;
     trim.frustumCulled = true;
     this.group.add(trim);
@@ -654,739 +559,84 @@ export class TimelineCol implements ITimelineCol {
   private _addLabels(): void {
     const files = 'abcdefgh';
     for (let i = 0; i < 8; i++) {
-      const f = Board3DManager._textSprite(files[i], '#7777aa');
+      const f = Board3DManager._labelSprite(files[i]);
       f.position.set(i - 3.5, 0.05, 4.4);
       f.scale.set(0.35, 0.35, 0.35);
       this.group.add(f);
-      const rk = Board3DManager._textSprite(String(8 - i), '#7777aa');
+      const rk = Board3DManager._labelSprite(String(8 - i));
       rk.position.set(-4.4, 0.05, i - 3.5);
       rk.scale.set(0.35, 0.35, 0.35);
       this.group.add(rk);
     }
   }
 
-  /** Add debug label showing timeline ID and xOffset above the board */
-  private _addDebugPositionLabel(): void {
-    // Create a larger canvas for the position indicator
-    const canvas = document.createElement('canvas');
-    canvas.width = 256;
-    canvas.height = 64;
-    const ctx = canvas.getContext('2d')!;
-
-    // Draw background with slight transparency
-    ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
-    ctx.roundRect(4, 4, 248, 56, 8);
-    ctx.fill();
-
-    // Draw text
-    ctx.font = 'bold 24px monospace';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillStyle = '#00ffff';  // Cyan color for visibility
-    ctx.fillText(`TL:${this.id} X:${this.xOffset}`, 128, 32);
-
-    const texture = new THREE.CanvasTexture(canvas);
-    const material = new THREE.SpriteMaterial({ map: texture, transparent: true });
-    const sprite = new THREE.Sprite(material);
-
-    // Position above the board (z = -5 puts it behind/above the board in view)
-    sprite.position.set(0, 0.1, -5.5);
-    sprite.scale.set(2.5, 0.625, 1);  // Wider than tall to match canvas aspect ratio
-
-    this._debugLabel = sprite;  // Store reference for 2D mode toggle
-    this.group.add(sprite);
+  /** Shared sprite material per piece texture (sprites never change their material per instance) */
+  private _pieceMaterial(tex: Texture): SpriteMaterial {
+    let mat = pieceMaterialCache.get(tex);
+    if (!mat) {
+      mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false });
+      pieceMaterialCache.set(tex, mat);
+    }
+    return mat;
   }
 
-  /* render pieces on current board - OPTIMIZED with diff-based updates and sprite pooling */
+  /** Render pieces on the current board, updating only squares whose piece changed */
   render(position: Board): void {
-    const timestamp = Date.now();
-
-    // ALWAYS LOG: Count pieces and sprites to help debug ghost piece issues
-    let positionPieceCount = 0;
-    for (let r = 0; r < 8; r++) {
-      for (let c = 0; c < 8; c++) {
-        if (position[r][c]) positionPieceCount++;
-      }
-    }
-
-    // Count sprites currently in the scene at MAIN_PIECE_Y
-    let sceneMainSprites = 0;
-    for (let i = 0; i < this.group.children.length; i++) {
-      const child = this.group.children[i];
-      if (this._isMainBoardSprite(child)) {
-        sceneMainSprites++;
-      }
-    }
-
-    console.log(`[Board3D.render] tl=${this.id} pos=${positionPieceCount} prev=${this._prevBoardState.size} map=${this._spriteMap.size} meshes=${this.pieceMeshes.length} scene=${sceneMainSprites}`);
-
-    // GHOST PIECE DETECTION: If scene has more sprites than position has pieces, we have ghosts!
-    if (sceneMainSprites > positionPieceCount) {
-      console.error(`[Board3D.render] GHOST_PIECE_BUG: Scene has ${sceneMainSprites} sprites but position only has ${positionPieceCount} pieces!`, {
-        timeline: this.id,
-        timestamp,
-        sceneSprites: sceneMainSprites,
-        positionPieces: positionPieceCount,
-        prevState: this._prevBoardState.size,
-        spriteMap: this._spriteMap.size,
-        pieceMeshes: this.pieceMeshes.length,
-      });
-    }
-
-    // REENTRANT CALL DETECTION: Catch overlapping render calls that could cause duplicates
-    if (this._renderInProgress) {
-      console.error(`[Board3D.render] REENTRANT_CALL_BUG: render() called while already executing!`, {
-        timeline: this.id,
-        timestamp,
-        stack: new Error().stack,
-      });
-      // Don't return - still try to render, but log the error
-    }
-    this._renderInProgress = true;
-
-    // DEBUG: Log render entry with stack trace to identify caller
-    if (DEBUG_MODE) {
-      const stackLines = new Error().stack?.split('\n').slice(1, 5).join('\n') || '';
-      console.log(`[Board3D.render] ENTRY timeline=${this.id} ts=${timestamp}`, {
-        prevStateSize: this._prevBoardState.size,
-        spriteMapSize: this._spriteMap.size,
-        pieceMeshesCount: this.pieceMeshes.length,
-        caller: stackLines,
-      });
-    }
-
-    // Build new board state map for comparison
-    const newBoardState = new Map<string, string>();
+    const next = new Map<string, string>();
     for (let r = 0; r < 8; r++) {
       for (let c = 0; c < 8; c++) {
         const piece = position[r][c];
-        if (piece) {
-          const posKey = `${r},${c}`;
-          const pieceKey = `${piece.type},${piece.color}`;
-          newBoardState.set(posKey, pieceKey);
-        }
+        if (piece) next.set(`${r},${c}`, `${piece.type},${piece.color}`);
       }
     }
 
-    // v0.1.79 MANDATORY SYNC PASS: Don't rely on diff-based removal - directly sync scene with newBoardState
-    // The ghost bug pattern: ghosts appear BETWEEN render calls, suggesting something outside render()
-    // is adding sprites, or THREE.js scene graph updates are deferred. By iterating ALL scene children
-    // and using this.group.remove() directly (not spritePool.release() which relies on parent.remove()),
-    // we ensure immediate removal.
-    const validPositionKeys = new Set(newBoardState.keys());
-    let mandatorySyncRemoved = 0;
-    const mandatorySyncRemovedPositions: string[] = [];
-    for (let i = this.group.children.length - 1; i >= 0; i--) {
-      const child = this.group.children[i];
-      if (this._isMainBoardSprite(child)) {
-        const col = Math.round(child.position.x + 3.5);
-        const row = Math.round(child.position.z + 3.5);
-        const posKey = `${row},${col}`;
-
-        if (!validPositionKeys.has(posKey)) {
-          // Ghost found! Force removal from scene graph
-          const spriteId = (child as PooledSprite)._spriteId ?? 'unknown';
-          console.warn(`[Board3D.render] MANDATORY_SYNC: Ghost sprite id=${spriteId} at ${posKey} not in valid positions, FORCE removing tl=${this.id}`);
-
-          // FORCE REMOVAL: Try multiple removal approaches to ensure it's gone
-          // 1. Direct removal from this.group
-          this.group.remove(child);
-
-          // 2. If it still has a parent (shouldn't happen but be safe), remove from parent
-          if (child.parent) {
-            console.error(`[Board3D.render] MANDATORY_SYNC: Sprite id=${spriteId} still has parent after group.remove()! Force removing from parent.`);
-            child.parent.remove(child);
-          }
-
-          // 3. Make it invisible as a fallback
-          child.visible = false;
-
-          // 4. Move it far off screen as nuclear option
-          child.position.set(10000, 10000, 10000);
-
-          // Return to pool (this will also try parent.remove())
-          spritePool.release(child as PooledSprite);
-
-          // Clean up tracking structures
-          if (this._spriteMap.has(posKey)) {
-            this._spriteMap.delete(posKey);
-          }
-          const idx = this.pieceMeshes.indexOf(child);
-          if (idx !== -1) {
-            this.pieceMeshes.splice(idx, 1);
-          }
-
-          mandatorySyncRemoved++;
-          mandatorySyncRemovedPositions.push(`${posKey}(id=${spriteId})`);
-        }
-      }
-    }
-    if (mandatorySyncRemoved > 0) {
-      console.error(`[Board3D.render] MANDATORY_SYNC_REMOVED: ${mandatorySyncRemoved} ghost sprites at positions=[${mandatorySyncRemovedPositions.join(',')}] tl=${this.id}`);
-      sessionGhostRemovalCount += mandatorySyncRemoved;
-      updateGhostCounterDisplay();
-    }
-
-    // Find what changed: removed, added, and unchanged positions
-    const toRemove: string[] = [];
-    const toAdd: string[] = [];
-
-    // Check old positions - what was removed or changed
-    this._prevBoardState.forEach((pieceKey, posKey) => {
-      const newPieceKey = newBoardState.get(posKey);
-      if (!newPieceKey || newPieceKey !== pieceKey) {
-        toRemove.push(posKey);
-      }
-    });
-
-    // Check new positions - what was added or changed
-    newBoardState.forEach((pieceKey, posKey) => {
-      const oldPieceKey = this._prevBoardState.get(posKey);
-      if (!oldPieceKey || oldPieceKey !== pieceKey) {
-        toAdd.push(posKey);
-      }
-    });
-
-    // PERFORMANCE: Skip if nothing changed
-    if (toRemove.length === 0 && toAdd.length === 0 && this._prevBoardState.size === newBoardState.size) {
-      if (DEBUG_MODE) {
-        console.log(`[Board3D.render] SKIP (no changes) timeline=${this.id}`);
-      }
-      this._renderInProgress = false;  // Reset flag on early return
-      return;
-    }
-
-    // DEBUG: Log what's changing
-    if (DEBUG_MODE) {
-      console.log(`[Board3D.render] CHANGES timeline=${this.id}`, {
-        toRemove,
-        toAdd,
-        prevSize: this._prevBoardState.size,
-        newSize: newBoardState.size,
-      });
-    }
-
-    // Remove sprites for positions that changed or are now empty
-    for (const posKey of toRemove) {
-      const sprite = this._spriteMap.get(posKey) as PooledSprite | undefined;
-      if (sprite) {
-        // ALWAYS LOG: Track removal to debug ghost pieces
-        console.log(`[Board3D.render] REMOVING sprite at ${posKey} tl=${this.id} pooled=${sprite._pooled}`);
-
-        // v0.1.77 FIX: Explicitly remove from scene BEFORE pool release
-        // This ensures removal even if sprite wasn't created via pool
-        this.group.remove(sprite);
-
-        // Return to pool for reuse (also handles non-pooled sprites now)
-        spritePool.release(sprite);
-        this._spriteMap.delete(posKey);
-        // Remove from pieceMeshes array
-        const idx = this.pieceMeshes.indexOf(sprite);
-        if (idx !== -1) {
-          this.pieceMeshes.splice(idx, 1);
-        }
-      } else {
-        // GHOST BUG INDICATOR: We wanted to remove a sprite at posKey but it's not in our map!
-        // This means the map is out of sync with what's in the scene
-        console.error(`[Board3D.render] GHOST_BUG: Wanted to remove sprite at ${posKey} but not found in _spriteMap! tl=${this.id}`, {
-          posKey,
-          prevState: this._prevBoardState.get(posKey),
-          spriteMapSize: this._spriteMap.size,
-        });
-      }
-    }
-
-    // Add sprites for positions that are new or changed
-    for (const posKey of toAdd) {
-      const [rStr, cStr] = posKey.split(',');
-      const r = parseInt(rStr);
-      const c = parseInt(cStr);
-      const piece = position[r][c];
-      if (!piece) continue;  // Safety check
-
-      // DEFENSIVE CHECK: If _spriteMap already has a sprite at this position,
-      // release it first to prevent overlaps from race conditions or edge cases
-      const existingSprite = this._spriteMap.get(posKey) as PooledSprite | undefined;
-      if (existingSprite) {
-        if (DEBUG_MODE) {
-          console.warn('[Board3D] Defensive cleanup: releasing existing sprite before adding new one', {
-            timeline: this.id,
-            posKey,
-            timestamp,
-            pooled: existingSprite._pooled,
-          });
-        }
-        // v0.1.77 FIX: Explicitly remove from scene BEFORE pool release
-        this.group.remove(existingSprite);
-        spritePool.release(existingSprite);
-        const existingIdx = this.pieceMeshes.indexOf(existingSprite);
-        if (existingIdx !== -1) {
-          this.pieceMeshes.splice(existingIdx, 1);
-        }
+    // Remove sprites whose square is now empty or holds a different piece
+    for (const [posKey, sprite] of this._spriteMap) {
+      if (next.get(posKey) !== this._prevBoardState.get(posKey)) {
+        spritePool.release(sprite as PooledSprite);
         this._spriteMap.delete(posKey);
       }
+    }
 
+    // Add sprites for squares without one
+    const scale = this._is2DMode ? TimelineCol.PIECE_SCALE_2D : TimelineCol.PIECE_SCALE_3D;
+    for (const [posKey] of next) {
+      if (this._spriteMap.has(posKey)) continue;
+      const [r, c] = posKey.split(',').map(Number);
+      const piece = position[r][c]!;
       const isW = piece.color === 'w';
       const chKey = isW ? piece.type.toUpperCase() : piece.type;
-      const tex = this._pieceTex(this._pieceChars[chKey], isW);
-      const material = new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false });
-
-      // Get sprite from pool (or create new one)
-      const sprite = spritePool.acquire(material);
+      const sprite = spritePool.acquire(this._pieceMaterial(this._pieceTex(this._pieceChars[chKey], isW)));
       sprite.position.set(c - 3.5, TimelineCol.MAIN_PIECE_Y, r - 3.5);
-      sprite.scale.set(0.88, 0.88, 0.88);
-
-      // DEBUG: Check if any sprite already exists at this position in the scene BEFORE adding
-      if (DEBUG_MODE) {
-        let existingCount = 0;
-        for (const child of this.group.children) {
-          if (this._isMainBoardSprite(child as Object3D)) {
-            const childCol = Math.round((child as Object3D).position.x + 3.5);
-            const childRow = Math.round((child as Object3D).position.z + 3.5);
-            if (childRow === r && childCol === c) {
-              existingCount++;
-              console.error(`[Board3D.render] DUPLICATE_CREATION: About to add sprite at ${posKey} but ${existingCount} already exists!`, {
-                timeline: this.id,
-                existingChild: child,
-                newSprite: sprite,
-              });
-            }
-          }
-        }
-      }
-
+      sprite.scale.set(scale, scale, scale);
       this.group.add(sprite);
-      this.pieceMeshes.push(sprite);
       this._spriteMap.set(posKey, sprite);
-
-      if (DEBUG_MODE) {
-        console.log(`[Board3D.render] ADDED sprite id=${(sprite as PooledSprite)._spriteId} at ${posKey} tl=${this.id}`);
-
-        // IMMEDIATE VERIFICATION: Check that we don't have duplicates at this position RIGHT NOW
-        let spritesAtThisPos = 0;
-        for (const child of this.group.children) {
-          if (this._isMainBoardSprite(child as Object3D)) {
-            const childCol = Math.round((child as Object3D).position.x + 3.5);
-            const childRow = Math.round((child as Object3D).position.z + 3.5);
-            if (childRow === r && childCol === c) {
-              spritesAtThisPos++;
-            }
-          }
-        }
-        if (spritesAtThisPos > 1) {
-          console.error(`[Board3D.render] POST_ADD_DUPLICATE: ${spritesAtThisPos} sprites at ${posKey} immediately after adding! Removing extras.`);
-          // Remove all but one
-          let kept = false;
-          for (let ci = this.group.children.length - 1; ci >= 0; ci--) {
-            const child = this.group.children[ci];
-            if (this._isMainBoardSprite(child as Object3D)) {
-              const childCol = Math.round((child as Object3D).position.x + 3.5);
-              const childRow = Math.round((child as Object3D).position.z + 3.5);
-              if (childRow === r && childCol === c) {
-                if (kept) {
-                  // Remove this duplicate
-                  this.group.remove(child);
-                  spritePool.release(child as PooledSprite);
-                  const idx = this.pieceMeshes.indexOf(child as Sprite);
-                  if (idx !== -1) this.pieceMeshes.splice(idx, 1);
-                } else {
-                  kept = true;  // Keep the first one we find (the most recently added)
-                }
-              }
-            }
-          }
-        }
-      }
     }
 
-    // Update stored state for next render
-    this._prevBoardState = newBoardState;
-
-    // CRITICAL FIX: Clean up any _spriteMap entries not in newBoardState
-    // This handles cases where _spriteMap and _prevBoardState got out of sync,
-    // which can happen during rapid state changes or edge cases in the diff logic.
-    // The diff-based removal only removes positions that were in _prevBoardState,
-    // so if _spriteMap has extra entries not in _prevBoardState, they would persist.
-    const spriteMapKeysToRemove: string[] = [];
-    this._spriteMap.forEach((sprite, posKey) => {
-      if (!newBoardState.has(posKey)) {
-        spriteMapKeysToRemove.push(posKey);
-      }
-    });
-    for (const posKey of spriteMapKeysToRemove) {
-      const sprite = this._spriteMap.get(posKey) as PooledSprite;
-      console.warn(`[Board3D.render] STALE_ENTRY_CLEANUP: Removing _spriteMap entry not in newBoardState tl=${this.id} posKey=${posKey} pooled=${sprite?._pooled}`);
-      // v0.1.77 FIX: Explicitly remove from scene BEFORE pool release
-      if (sprite) {
-        this.group.remove(sprite);
-        spritePool.release(sprite);
-      }
-      this._spriteMap.delete(posKey);
-      const idx = this.pieceMeshes.indexOf(sprite);
-      if (idx !== -1) {
-        this.pieceMeshes.splice(idx, 1);
-      }
-    }
-
-    // SAFETY: Clean up any orphaned sprites not in our map (in case of bugs)
-    // This handles edge cases like rapid state changes
-    // Use position-based lookup instead of identity to catch sprites that may
-    // have been added at the same position with different object references
-    for (let i = this.group.children.length - 1; i >= 0; i--) {
-      const child = this.group.children[i];
-      if (this._isMainBoardSprite(child)) {
-        // Calculate position key matching _spriteMap format
-        const col = Math.round(child.position.x + 3.5);
-        const row = Math.round(child.position.z + 3.5);
-        const posKey = `${row},${col}`;
-
-        // Check if THIS sprite is the canonical one at this position
-        const mapSprite = this._spriteMap.get(posKey);
-        if (!mapSprite || mapSprite !== child) {
-          // Either position not in map, or a different sprite is canonical - this is orphaned
-          console.warn(`[Board3D.render] ORPHAN_CLEANUP timeline=${this.id} posKey=${posKey}`, {
-            hasMapSprite: !!mapSprite,
-            isSameSprite: mapSprite === child,
-            childY: child.position.y,
-          });
-          this.group.remove(child);
-          spritePool.release(child as PooledSprite);
-          // Also remove from pieceMeshes if present
-          const idx = this.pieceMeshes.indexOf(child);
-          if (idx !== -1) {
-            this.pieceMeshes.splice(idx, 1);
-          }
-        }
-      }
-    }
-
-    // FINAL AUTHORITY: Remove any scene sprites at positions not in newBoardState
-    // This is the nuclear cleanup that catches all edge cases - newBoardState is the
-    // single source of truth for what pieces should exist
-    // ALWAYS LOG: Track this pass to confirm cleanup is running
-    let ghostCleanupRemovedCount = 0;
-    const ghostCleanupPositionsBefore: string[] = [];
-    for (let i = this.group.children.length - 1; i >= 0; i--) {
-      const child = this.group.children[i];
-      if (this._isMainBoardSprite(child)) {
-        const col = Math.round(child.position.x + 3.5);
-        const row = Math.round(child.position.z + 3.5);
-        const posKey = `${row},${col}`;
-        ghostCleanupPositionsBefore.push(posKey);
-
-        // If there's no piece at this position in the authoritative board state, remove it
-        if (!newBoardState.has(posKey)) {
-          console.warn(`[Board3D.render] GHOST_CLEANUP: Removing sprite at ${posKey} not in newBoardState tl=${this.id}`);
-          this.group.remove(child);
-          spritePool.release(child as PooledSprite);
-          // Clean up _spriteMap if it still has this entry (shouldn't, but be safe)
-          if (this._spriteMap.has(posKey)) {
-            this._spriteMap.delete(posKey);
-          }
-          const idx = this.pieceMeshes.indexOf(child);
-          if (idx !== -1) {
-            this.pieceMeshes.splice(idx, 1);
-          }
-          ghostCleanupRemovedCount++;
-        }
-      }
-    }
-    // ALWAYS LOG: Confirm GHOST_CLEANUP ran, even if nothing removed
-    console.log(`[Board3D.render] GHOST_CLEANUP_PASS: tl=${this.id} scanned=${ghostCleanupPositionsBefore.length} removed=${ghostCleanupRemovedCount} positions=[${ghostCleanupPositionsBefore.join(',')}]`);
-
-    // FINAL SYNC: Ensure _spriteMap exactly matches newBoardState
-    // ALWAYS LOG: Report sync status even if sizes match
-    const finalSyncMismatch = this._spriteMap.size !== newBoardState.size;
-    console.log(`[Board3D.render] FINAL_SYNC_CHECK: tl=${this.id} spriteMap=${this._spriteMap.size} newBoardState=${newBoardState.size} mismatch=${finalSyncMismatch}`);
-    if (finalSyncMismatch) {
-      console.warn(`[Board3D.render] FINAL_SYNC: _spriteMap.size=${this._spriteMap.size} != newBoardState.size=${newBoardState.size}, cleaning up tl=${this.id}`);
-      const keysToDelete: string[] = [];
-      this._spriteMap.forEach((sprite, posKey) => {
-        if (!newBoardState.has(posKey)) {
-          keysToDelete.push(posKey);
-        }
-      });
-      for (const posKey of keysToDelete) {
-        const sprite = this._spriteMap.get(posKey);
-        if (sprite) {
-          // v0.1.77 FIX: Explicitly remove from scene BEFORE pool release
-          this.group.remove(sprite);
-          spritePool.release(sprite as PooledSprite);
-          const idx = this.pieceMeshes.indexOf(sprite);
-          if (idx !== -1) {
-            this.pieceMeshes.splice(idx, 1);
-          }
-        }
-        this._spriteMap.delete(posKey);
-      }
-    }
-
-    // VERIFICATION PASS: Re-count scene sprites AFTER all cleanup
-    // If still mismatched, do ANOTHER explicit pass with detailed logging
-    let postCleanupSceneSprites = 0;
-    const postCleanupSpritePositions: string[] = [];
-    for (let i = 0; i < this.group.children.length; i++) {
-      const child = this.group.children[i];
-      if (this._isMainBoardSprite(child)) {
-        postCleanupSceneSprites++;
-        const col = Math.round(child.position.x + 3.5);
-        const row = Math.round(child.position.z + 3.5);
-        postCleanupSpritePositions.push(`${row},${col}`);
-      }
-    }
-    console.log(`[Board3D.render] VERIFICATION_PASS: tl=${this.id} sceneSprites=${postCleanupSceneSprites} expected=${newBoardState.size} positions=[${postCleanupSpritePositions.join(',')}]`);
-
-    // EMERGENCY SECOND CLEANUP: If we STILL have more sprites than pieces, something is very wrong
-    // Do explicit removal by iterating scene and force-removing anything not in newBoardState
-    if (postCleanupSceneSprites > newBoardState.size) {
-      console.error(`[Board3D.render] EMERGENCY_CLEANUP: Still have ghosts after cleanup! scene=${postCleanupSceneSprites} expected=${newBoardState.size} tl=${this.id}`);
-      let emergencyRemoved = 0;
-      for (let i = this.group.children.length - 1; i >= 0; i--) {
-        const child = this.group.children[i];
-        if (this._isMainBoardSprite(child)) {
-          const col = Math.round(child.position.x + 3.5);
-          const row = Math.round(child.position.z + 3.5);
-          const posKey = `${row},${col}`;
-          if (!newBoardState.has(posKey)) {
-            console.error(`[Board3D.render] EMERGENCY_REMOVING: posKey=${posKey} x=${child.position.x} y=${child.position.y} z=${child.position.z} tl=${this.id}`);
-            // Force removal from scene using explicit parent removal
-            if (child.parent) {
-              child.parent.remove(child);
-            } else {
-              this.group.remove(child);
-            }
-            spritePool.release(child as PooledSprite);
-            emergencyRemoved++;
-          }
-        }
-      }
-      console.error(`[Board3D.render] EMERGENCY_CLEANUP_DONE: removed=${emergencyRemoved} tl=${this.id}`);
-    }
-
-    // DEBUG: Validation checks
-    if (DEBUG_MODE) {
-      const expectedCount = newBoardState.size;
-      if (this.pieceMeshes.length !== expectedCount) {
-        console.error('[Board3D] VISUAL_TRAILS_BUG: Sprite count mismatch!', {
-          timeline: this.id,
-          timestamp,
-          expected: expectedCount,
-          actual: this.pieceMeshes.length,
-          removed: toRemove.length,
-          added: toAdd.length,
-        });
-      }
-
-      // Check for duplicates - use same key format as _spriteMap ("row,col")
-      let spritesAtPieceHeight = 0;
-      const spritePositions: Map<string, number> = new Map();
-      this.group.traverse((child: Object3D) => {
-        if ((child as Sprite).isSprite && Math.abs(child.position.y - TimelineCol.MAIN_PIECE_Y) < 0.01) {
-          const x = child.position.x;
-          const z = child.position.z;
-          if (x >= -4 && x <= 4 && z >= -4 && z <= 4) {
-            spritesAtPieceHeight++;
-            // Use board coordinates matching _spriteMap format
-            const col = Math.round(x + 3.5);
-            const row = Math.round(z + 3.5);
-            const posKey = `${row},${col}`;
-            spritePositions.set(posKey, (spritePositions.get(posKey) || 0) + 1);
-          }
-        }
-      });
-
-      const duplicates: string[] = [];
-      spritePositions.forEach((count, pos) => {
-        if (count > 1) duplicates.push(`${pos} (${count} sprites)`);
-      });
-
-      if (duplicates.length > 0) {
-        console.error('[Board3D] PIECE_OVERLAP_BUG: Duplicate sprites detected!', {
-          timeline: this.id,
-          timestamp,
-          duplicates,
-        });
-      }
-    }
-
-    // RENDER_COMPLETE: Final counts AFTER all cleanup to verify bug is actually fixed
-    let finalSceneSprites = 0;
-    const finalSpritePositions: string[] = [];
-    for (let i = 0; i < this.group.children.length; i++) {
-      const child = this.group.children[i];
-      if (this._isMainBoardSprite(child)) {
-        finalSceneSprites++;
-        const col = Math.round(child.position.x + 3.5);
-        const row = Math.round(child.position.z + 3.5);
-        finalSpritePositions.push(`${row},${col}`);
-      }
-    }
-    const stillHasGhosts = finalSceneSprites > newBoardState.size;
-    console.log(`[Board3D.render] RENDER_COMPLETE: tl=${this.id} finalScene=${finalSceneSprites} expected=${newBoardState.size} spriteMap=${this._spriteMap.size} pieceMeshes=${this.pieceMeshes.length} GHOSTS_REMAIN=${stillHasGhosts}`);
-    if (stillHasGhosts) {
-      console.error(`[Board3D.render] RENDER_COMPLETE_FAILURE: Ghost pieces STILL present after render! finalPositions=[${finalSpritePositions.join(',')}] tl=${this.id}`);
-
-      // v0.1.79: Throw visible error to make ghost bugs impossible to ignore
-      // This helps track down the root cause by failing loudly instead of silently accumulating ghosts
-      const expectedPositions = Array.from(newBoardState.keys()).sort().join(',');
-      const errorMsg = `GHOST_PIECE_BUG: Timeline ${this.id} has ${finalSceneSprites} sprites but expected ${newBoardState.size}. Scene positions: [${finalSpritePositions.join(',')}]. Expected positions: [${expectedPositions}]`;
-      console.error(errorMsg);
-
-      // Create a visible on-screen error indicator (non-blocking)
-      if (typeof document !== 'undefined') {
-        const existingError = document.getElementById('ghost-piece-error');
-        if (!existingError) {
-          const errorDiv = document.createElement('div');
-          errorDiv.id = 'ghost-piece-error';
-          errorDiv.style.cssText = 'position:fixed;top:10px;left:50%;transform:translateX(-50%);background:red;color:white;padding:10px 20px;border-radius:5px;z-index:10000;font-family:monospace;font-size:12px;max-width:80%;overflow:auto;';
-          errorDiv.textContent = `GHOST BUG: TL${this.id} scene=${finalSceneSprites} expected=${newBoardState.size}`;
-          document.body.appendChild(errorDiv);
-          // Auto-remove after 5 seconds
-          setTimeout(() => errorDiv.remove(), 5000);
-        }
-      }
-    }
-
-    // Reset reentrant flag at end of render
-    this._renderInProgress = false;
+    this._prevBoardState = next;
   }
 
-  /**
-   * Validates that no duplicate sprites exist at MAIN_PIECE_Y height.
-   * If duplicates are found, logs an error with details and removes the extras.
-   * This is a defensive check to catch edge cases where sprites weren't properly
-   * cleaned up during render(), which can happen due to Three.js scene graph timing.
-   *
-   * IMPORTANT: When removing duplicates, this method also syncs:
-   * - pieceMeshes array (removes duplicate entries)
-   * - _spriteMap (updates to point to the kept sprite)
-   * - Returns duplicates to spritePool for reuse
-   *
-   * @param currentBoard Optional - if provided and duplicates found, will do a full rebuild
-   * @returns true if no duplicates were found (validation passed),
-   *          false if duplicates were detected and auto-fixed
-   */
-  validateNoDuplicates(currentBoard?: Board): boolean {
-    const timestamp = Date.now();
-    const positionMap = new Map<string, { sprite: Sprite; pieceInfo: string; boardPosKey: string }[]>();
-
-    // First pass: collect all sprites at MAIN_PIECE_Y grouped by position
-    // CRITICAL: Use SAME key format as _spriteMap ("row,col" integers) to ensure consistency
-    for (let i = 0; i < this.group.children.length; i++) {
-      const child = this.group.children[i];
-      if (this._isMainBoardSprite(child)) {
-        // Calculate board position key (row,col) - MUST match _spriteMap format from render()
-        const col = Math.round(child.position.x + 3.5);
-        const row = Math.round(child.position.z + 3.5);
-        const posKey = `${row},${col}`;  // Same format as render() uses for _spriteMap
-
-        // Extract piece info from sprite texture/material for diagnostics
-        const material = child.material as SpriteMaterial | undefined;
-        const pieceInfo = material?.map?.name ?? material?.name ?? 'unknown';
-
-        const boardPosKey = posKey;  // Already in the correct format
-
-        if (!positionMap.has(posKey)) {
-          positionMap.set(posKey, []);
-        }
-        positionMap.get(posKey)!.push({ sprite: child, pieceInfo, boardPosKey });
-      }
+  /** Number of piece sprites on the current board (used by tests) */
+  pieceSpriteCount(): number {
+    let count = 0;
+    for (const child of this.group.children) {
+      if (this._isMainBoardSprite(child)) count++;
     }
-
-    // Second pass: identify duplicates
-    let foundDuplicates = false;
-    const duplicateInfo: string[] = [];
-    positionMap.forEach((sprites, posKey) => {
-      if (sprites.length > 1) {
-        foundDuplicates = true;
-
-        // Convert position key (now "row,col" format) back to chess square for logging
-        const [rowStr, colStr] = posKey.split(',');
-        const row = parseInt(rowStr);
-        const col = parseInt(colStr);
-
-        // Validate calculated square is within valid chess board range
-        let square: string;
-        if (col >= 0 && col <= 7 && row >= 0 && row <= 7) {
-          square = String.fromCharCode(97 + col) + (8 - row);
-        } else {
-          square = `invalid(col=${col},row=${row})`;
-        }
-
-        duplicateInfo.push(`${square}: ${sprites.length} sprites (${sprites.map(s => s.pieceInfo).join(', ')})`);
-      }
-    });
-
-    if (foundDuplicates) {
-      console.error('[Board3D] PIECE_OVERLAP_BUG: Duplicate sprites detected!', {
-        timeline: this.id,
-        timestamp,
-        duplicates: duplicateInfo,
-      });
-
-      // If we have the current board state, do a complete rebuild instead of trying to fix in place
-      if (currentBoard) {
-        console.warn('[Board3D] Performing full rebuild to fix duplicates');
-        this.forceFullRebuild(currentBoard);
-        return false;
-      }
-
-      // Otherwise, try to fix in place (legacy behavior)
-      positionMap.forEach((sprites, posKey) => {
-        if (sprites.length > 1) {
-          // Keep the first sprite, update _spriteMap to point to it
-          const keptSprite = sprites[0].sprite;
-          const boardPosKey = sprites[0].boardPosKey;
-          this._spriteMap.set(boardPosKey, keptSprite);
-
-          // Remove the duplicate sprites (all but the first)
-          for (let i = 1; i < sprites.length; i++) {
-            const spriteEntry = sprites[i];
-            if (spriteEntry && spriteEntry.sprite) {
-              // Remove from pieceMeshes array
-              const pieceMeshIdx = this.pieceMeshes.indexOf(spriteEntry.sprite);
-              if (pieceMeshIdx !== -1) {
-                this.pieceMeshes.splice(pieceMeshIdx, 1);
-              }
-
-              // v0.1.77 FIX: Explicitly remove from scene BEFORE pool release
-              this.group.remove(spriteEntry.sprite);
-              // Return to sprite pool (handles removal from parent and disposal)
-              spritePool.release(spriteEntry.sprite as PooledSprite);
-            }
-          }
-        }
-      });
-    }
-
-    return !foundDuplicates;
+    return count;
   }
 
-  /**
-   * Force a complete rebuild of all piece sprites.
-   * This is a nuclear option for when state gets out of sync.
-   * Clears all existing sprites and re-renders from scratch.
-   */
+  /** Drop all piece sprites and re-render from scratch */
   forceFullRebuild(position: Board): void {
-    console.warn(`[Board3D] FORCE_REBUILD timeline=${this.id} - clearing all state and re-rendering`);
-
-    // Clear all piece sprites - return to pool
-    // v0.1.77 FIX: Explicitly remove from scene BEFORE pool release
-    for (let i = this.pieceMeshes.length - 1; i >= 0; i--) {
-      const sprite = this.pieceMeshes[i] as PooledSprite;
-      this.group.remove(sprite);
-      spritePool.release(sprite);
-    }
-    this.pieceMeshes.length = 0;
-
-    // Clear tracking state
-    this._prevBoardState.clear();
-    this._spriteMap.clear();
-
-    // Now render from scratch
+    this._clearPieceSprites();
     this.render(position);
+  }
 
-    console.warn(`[Board3D] FORCE_REBUILD complete - now have ${this.pieceMeshes.length} sprites`);
+  private _clearPieceSprites(): void {
+    for (const sprite of this._spriteMap.values()) {
+      spritePool.release(sprite as PooledSprite);
+    }
+    this._spriteMap.clear();
+    this._prevBoardState.clear();
   }
 
   /* highlight / selection */
@@ -1777,15 +1027,7 @@ export class TimelineCol implements ITimelineCol {
     while (this.moveLineGroup.children.length > TimelineCol.MAX_MOVE_LINES) {
       const old = this.moveLineGroup.children[0];
       this.moveLineGroup.remove(old);
-      // Dispose of materials to prevent memory leak
-      if (old instanceof THREE.Group) {
-        old.traverse((child: Object3D) => {
-          const mesh = child as Mesh;
-          if (mesh.isMesh && mesh.material) {
-            (mesh.material as Material).dispose();
-          }
-        });
-      }
+      disposeTree(old);
     }
   }
 
@@ -1806,40 +1048,6 @@ export class TimelineCol implements ITimelineCol {
       this.group.remove(old);
     }
     this._layoutLayers();
-
-    // VALIDATION: Ensure all history layer sprites are positioned below the main board
-    // History piece sprites are at local Y=HISTORY_PIECE_Y, and the group should be at negative Y
-    // So world Y of any history sprite should be negative
-    for (let i = 0; i < this.historyLayers.length; i++) {
-      const layer = this.historyLayers[i];
-      const groupY = layer.position.y;
-      const expectedMinY = -(i + 1) * TimelineCol.LAYER_GAP;
-
-      if (Math.abs(groupY - expectedMinY) > 0.001) {
-        console.error('[Board3D] PIECE_OVERLAP_BUG: History layer at wrong Y position!', {
-          layerIndex: i,
-          actualY: groupY,
-          expectedY: expectedMinY,
-          timelineId: this.id,
-        });
-      }
-
-      // Check that all sprites in this layer have negative world Y
-      layer.traverse((child: Object3D) => {
-        if ((child as Sprite).isSprite) {
-          const worldY = groupY + child.position.y;
-          if (worldY >= 0) {
-            console.error('[Board3D] PIECE_OVERLAP_BUG: History sprite at non-negative world Y!', {
-              layerIndex: i,
-              groupY,
-              localY: child.position.y,
-              worldY,
-              timelineId: this.id,
-            });
-          }
-        }
-      });
-    }
   }
 
   private _makeHistoryBoard(position: Board): Group {
@@ -1890,7 +1098,9 @@ export class TimelineCol implements ITimelineCol {
       }
     }
 
-    // Pieces
+    // Pieces - one material per piece texture within this layer (opacity is per layer)
+    const spriteMats = new Map<Texture, SpriteMaterial>();
+    g.userData.spriteMats = spriteMats;
     for (let r2 = 0; r2 < 8; r2++) {
       for (let c2 = 0; c2 < 8; c2++) {
         const piece = position[r2][c2];
@@ -1898,9 +1108,12 @@ export class TimelineCol implements ITimelineCol {
         const isW = piece.color === 'w';
         const chKey = isW ? piece.type.toUpperCase() : piece.type;
         const tex = this._pieceTex(this._pieceChars[chKey], isW);
-        const sp = new THREE.Sprite(
-          new THREE.SpriteMaterial({ map: tex, transparent: true, opacity: 0.25, depthWrite: false })
-        );
+        let spMat = spriteMats.get(tex);
+        if (!spMat) {
+          spMat = new THREE.SpriteMaterial({ map: tex, transparent: true, opacity: 0.25, depthWrite: false });
+          spriteMats.set(tex, spMat);
+        }
+        const sp = new THREE.Sprite(spMat);
         sp.position.set(c2 - 3.5, TimelineCol.HISTORY_PIECE_Y, r2 - 3.5);
         sp.scale.set(0.7, 0.7, 0.7);
         sp.frustumCulled = true;
@@ -1923,28 +1136,14 @@ export class TimelineCol implements ITimelineCol {
     lightMat?.dispose();
     darkMat?.dispose();
 
-    // Dispose of all sprites in the layer to prevent memory leaks
-    layerGroup.traverse((child: Object3D) => {
-      const obj = child as Sprite;
-      if (obj.isSprite && obj.material) {
-        (obj.material as SpriteMaterial).dispose();
-      }
-    });
+    const spriteMats = layerGroup.userData.spriteMats as Map<Texture, SpriteMaterial> | undefined;
+    spriteMats?.forEach((m) => m.dispose());
   }
 
   private _layoutLayers(): void {
     for (let i = 0; i < this.historyLayers.length; i++) {
       const targetY = -(i + 1) * TimelineCol.LAYER_GAP;
       this.historyLayers[i].position.y = targetY;
-
-      // VALIDATION: Ensure history layers are always below the main board
-      if (targetY >= 0) {
-        console.error('[Board3D] PIECE_OVERLAP_BUG: History layer at non-negative Y!', {
-          layerIndex: i,
-          targetY,
-          timelineId: this.id,
-        });
-      }
 
       // Calculate snapshot index for this layer (most recent history is layer 0)
       // historyLayers[0] corresponds to the most recent snapshot before current
@@ -1965,9 +1164,7 @@ export class TimelineCol implements ITimelineCol {
     }
 
     // Rebuild inter-layer lines
-    while (this.interLayerGroup.children.length) {
-      this.interLayerGroup.remove(this.interLayerGroup.children[0]);
-    }
+    clearGroup(this.interLayerGroup);
 
     for (let j = 0; j < this.historyLayers.length; j++) {
       const layer = this.historyLayers[j];
@@ -2002,89 +1199,52 @@ export class TimelineCol implements ITimelineCol {
     if (lightMat) lightMat.opacity = opacity;
     if (darkMat) darkMat.opacity = opacity;
 
-    // Also update sprite opacity (history piece sprites still need traversal)
-    group.traverse((child: Object3D) => {
-      const obj = child as Sprite;
-      if (obj.isSprite && obj.material && (obj.material as Material).transparent) {
-        (obj.material as Material).opacity = opacity * 1.1;
-      }
-    });
+    const spriteMats = group.userData.spriteMats as Map<Texture, SpriteMaterial> | undefined;
+    spriteMats?.forEach((m) => { m.opacity = opacity * 1.1; });
   }
 
   getAllSquareMeshes(): Mesh[] {
     return this.squareMeshes.concat(this.historySquareMeshes);
   }
 
+  private _active = false;
+  private _highlighted = false;
+
   setActive(active: boolean): void {
-    this.group.children.forEach((child) => {
-      const mesh = child as Mesh;
-      if (
-        mesh.geometry &&
-        (mesh.geometry as BoxGeometry).type === 'BoxGeometry' &&
-        (mesh.geometry as BoxGeometry).parameters.width > 8.5 &&
-        mesh.position.y < -0.1
-      ) {
-        (mesh.material as MeshStandardMaterial).emissive = active
-          ? new THREE.Color(0x222244)
-          : new THREE.Color(0);
-      }
-    });
+    this._active = active;
+    this._applyBaseGlow();
   }
 
   setHighlighted(highlighted: boolean): void {
-    this.group.children.forEach((child) => {
-      const mesh = child as Mesh;
-      if (
-        mesh.geometry &&
-        (mesh.geometry as BoxGeometry).type === 'BoxGeometry' &&
-        (mesh.geometry as BoxGeometry).parameters.width > 8.5 &&
-        mesh.position.y < -0.1
-      ) {
-        if (highlighted) {
-          (mesh.material as MeshStandardMaterial).emissive = new THREE.Color(0x446688);
-        } else {
-          (mesh.material as MeshStandardMaterial).emissive = new THREE.Color(0);
-        }
-      }
-    });
+    this._highlighted = highlighted;
+    this._applyBaseGlow();
   }
+
+  private _applyBaseGlow(): void {
+    const glow = this._highlighted ? 0x446688 : this._active ? 0x2a2a5a : 0x000000;
+    this.baseMat.emissive.setHex(glow);
+    this.trimMat.emissive.setHex(this._active ? 0x3a3a88 : 0x000000);
+  }
+
+  private _boardGlowState: 'checkmate' | 'draw' | 'none' = 'none';
 
   /** Set board state glow (checkmate = red, draw = amber/orange, none = clear) */
   setBoardGlow(state: 'checkmate' | 'draw' | 'none'): void {
-    let glowColor: Color | null = null;
-    if (state === 'checkmate') {
-      glowColor = new THREE.Color(0xff3333);
-    } else if (state === 'draw') {
-      glowColor = new THREE.Color(0xffa500);  // Amber/orange for draw - more noticeable than grey
-    }
+    if (state === this._boardGlowState) return;
+    this._boardGlowState = state;
+    const glowColor = state === 'checkmate' ? CHECKMATE_GLOW : state === 'draw' ? DRAW_GLOW : null;
 
     // Apply glow to all square meshes on the main board
     const glowIntensity = state === 'draw' ? 0.4 : 0.3;  // Slightly stronger for draw
     for (const mesh of this.squareMeshes) {
       const mat = mesh.material as MeshStandardMaterial;
-      if (glowColor) {
-        mat.emissive = glowColor;
-        mat.emissiveIntensity = glowIntensity;
-      } else {
-        mat.emissive = new THREE.Color(0);
-        mat.emissiveIntensity = 0;
-      }
+      mat.emissive.copy(glowColor ?? BLACK);
+      mat.emissiveIntensity = glowColor ? glowIntensity : 0;
     }
   }
 
   clearAll(): void {
-    // Clear and return piece sprites to pool for reuse
-    // v0.1.77 FIX: Explicitly remove from scene BEFORE pool release
-    for (let i = this.pieceMeshes.length - 1; i >= 0; i--) {
-      const sprite = this.pieceMeshes[i] as PooledSprite;
-      this.group.remove(sprite);
-      spritePool.release(sprite);
-    }
-    this.pieceMeshes.length = 0;
-
-    // Clear diff-based rendering state
-    this._prevBoardState.clear();
-    this._spriteMap.clear();
+    this._clearPieceSprites();
 
     // Clear history layers and dispose of their contents
     for (let i = 0; i < this.historyLayers.length; i++) {
@@ -2095,12 +1255,8 @@ export class TimelineCol implements ITimelineCol {
     this.historyLayers = [];
     this.historySquareMeshes = [];
     this.drawnBranchIndices.clear();  // Clear branch tracking
-    while (this.moveLineGroup.children.length) {
-      this.moveLineGroup.remove(this.moveLineGroup.children[0]);
-    }
-    while (this.interLayerGroup.children.length) {
-      this.interLayerGroup.remove(this.interLayerGroup.children[0]);
-    }
+    clearGroup(this.moveLineGroup);
+    clearGroup(this.interLayerGroup);
     this.clearHighlights();
 
     // Return last move highlights to pool
@@ -2125,6 +1281,8 @@ export class TimelineCol implements ITimelineCol {
         (mesh.material as Material).dispose();
       }
     }
+    this.baseMat.dispose();
+    this.trimMat.dispose();
     this.scene.remove(this.group);
   }
 
@@ -2142,24 +1300,12 @@ export class TimelineCol implements ITimelineCol {
     }
     // Toggle inter-layer lines (the vertical connectors)
     this.interLayerGroup.visible = !enabled;
-    // Hide debug label in 2D mode (prevents overlap with adjacent boards)
-    if (this._debugLabel) {
-      this._debugLabel.visible = !enabled;
-    }
     // Keep move line group visible (blue/orange move indicators on board)
     // this.moveLineGroup stays visible
 
-    // Scale pieces for 2D mode - larger and more prominent
-    const scale2D = 1.25;  // Bigger pieces for 2D top-down view (more prominent)
-    const scale3D = 0.88;  // Normal 3D scale
-    const targetScale = enabled ? scale2D : scale3D;
-
-    // Update all main board sprites
+    // Larger pieces in the top-down 2D view
+    const targetScale = enabled ? TimelineCol.PIECE_SCALE_2D : TimelineCol.PIECE_SCALE_3D;
     for (const sprite of this._spriteMap.values()) {
-      sprite.scale.set(targetScale, targetScale, targetScale);
-    }
-    // Also update pieceMeshes array (may have some sprites not in map during transitions)
-    for (const sprite of this.pieceMeshes) {
       sprite.scale.set(targetScale, targetScale, targetScale);
     }
   }
@@ -2183,7 +1329,6 @@ class Board3DManager implements IBoard3D {
 
   // Performance: render-on-demand
   private _needsRender = true;
-  private _lastRenderTime = 0;
 
   // Performance: FPS tracking
   private _frameCount = 0;
@@ -2194,11 +1339,10 @@ class Board3DManager implements IBoard3D {
   private _lastCameraPosition = new THREE.Vector3();
   private _lastCameraTarget = new THREE.Vector3();
 
-  // Performance: throttle particle animation (frame counter)
-  private _particleAnimFrame = 0;
-  private static readonly PARTICLE_ANIM_INTERVAL = 3;  // Update every 3 frames
-
-  // Note: DEBUG_MODE is now a module-level constant at the top of this file
+  // Ambient animation is throttled to this interval (seconds) to keep idle cost low
+  private static readonly AMBIENT_INTERVAL = 1 / 30;
+  private _lastAmbientTime = 0;
+  private _reducedMotion = typeof matchMedia !== 'undefined' && matchMedia('(prefers-reduced-motion: reduce)').matches;
 
   // Performance: pooled scratch vectors (avoid GC churn from frequent allocations)
   // These are reused across frames in _updatePanning() for camera movement calculations.
@@ -2243,14 +1387,13 @@ class Board3DManager implements IBoard3D {
   // Minimum opacity - lines never fully disappear
   private static readonly CROSS_LINE_MIN_OPACITY = 0.35;
   // Track cross-line mesh groups for efficient opacity updates (index matches _branchLineData cross entries)
-  private _crossLineMeshes: Array<{ group: Group; dataIndex: number; baseOpacity: number }> = [];
+  private _crossLineMeshes: Array<{ group: Group; createdAt: number; baseOpacity: number }> = [];
   private onSquareClick:
     | ((info: { timelineId: number; square: string; turn: number; isHistory: boolean }) => void)
     | null = null;
 
   private _panKeys: PanKeyState = { w: false, a: false, s: false, d: false, q: false, e: false };
   private _panSpeed = 0.12;  // Slowed down from 0.25 for smoother control
-  private _zoomSpeed = 0.4;
   private _focusTween: FocusTween | undefined;
   private _resizeTimeout: number | null = null;
   private _resizeObserver: ResizeObserver | null = null;
@@ -2263,6 +1406,7 @@ class Board3DManager implements IBoard3D {
   private _boundResize: (() => void) | null = null;
   private _boundKeyDown: ((e: KeyboardEvent) => void) | null = null;
   private _boundKeyUp: ((e: KeyboardEvent) => void) | null = null;
+  private _boundBlur: (() => void) | null = null;
   private _boundPageHide: ((e: PageTransitionEvent) => void) | null = null;
   private _boundVisibilityChange: (() => void) | null = null;
   private _boundContextLost: ((e: Event) => void) | null = null;
@@ -2416,8 +1560,6 @@ class Board3DManager implements IBoard3D {
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     this.renderer.setSize(this.container.clientWidth, this.container.clientHeight);
     this.renderer.setClearColor(0x080818);
-    this.renderer.shadowMap.enabled = true;
-    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     this.container.appendChild(this.renderer.domElement);
 
     // WebGL context loss handling - prevents white screen crashes
@@ -2534,6 +1676,11 @@ class Board3DManager implements IBoard3D {
     // WASD keyboard panning
     window.addEventListener('keydown', this._boundKeyDown);
     window.addEventListener('keyup', this._boundKeyUp);
+    // Keyups are lost when the window loses focus mid-press; release all pan keys
+    this._boundBlur = () => {
+      this._panKeys = { w: false, a: false, s: false, d: false, q: false, e: false };
+    };
+    window.addEventListener('blur', this._boundBlur);
 
     // Tab close/navigation cleanup - use pagehide for fast, non-blocking cleanup
     window.addEventListener('pagehide', this._boundPageHide);
@@ -2553,8 +1700,6 @@ class Board3DManager implements IBoard3D {
       this.scene!,
       id,
       xOffset,
-      this.TIMELINE_COLORS[id % this.TIMELINE_COLORS.length],
-      this._texCache,
       this.PIECE_CHARS,
       this._pieceTexture.bind(this)
     );
@@ -2663,15 +1808,21 @@ class Board3DManager implements IBoard3D {
   private _rebuildBranchLines(): void {
     if (!this.branchLineGroup) return;
 
-    // Clear existing lines
-    while (this.branchLineGroup.children.length) {
-      this.branchLineGroup.remove(this.branchLineGroup.children[0]);
-    }
-
-    // Clear cross-line mesh tracking
+    clearGroup(this.branchLineGroup);
     this._crossLineMeshes = [];
 
-    // Rebuild each line from metadata
+    // Drop lines whose endpoints have both scrolled past the visible history stack
+    const maxDepth = TimelineCol.MAX_LAYERS;
+    this._branchLineData = this._branchLineData.filter((data) => {
+      const fromCol = this.timelineCols[data.fromTlId];
+      const toCol = this.timelineCols[data.toTlId];
+      if (!fromCol || !toCol) return false;
+      if (data.type === 'branch') return true;
+      const fromDepth = fromCol.historyLayers.length - data.fromTurn;
+      const toDepth = toCol.historyLayers.length - (data.toTurn ?? 0);
+      return fromDepth <= maxDepth || toDepth <= maxDepth;
+    });
+
     for (const data of this._branchLineData) {
       const fromCol = this.timelineCols[data.fromTlId];
       const toCol = this.timelineCols[data.toTlId];
@@ -2725,24 +1876,14 @@ class Board3DManager implements IBoard3D {
         const avgDepth = (depthSinceCrossFrom + depthSinceCrossTo) / 2;
         const depthOpacity = Math.max(0.2, 1 - avgDepth * 0.08);
 
-        // Calculate time-based fade for cross-timeline lines
+        // Fresh cross-timeline lines start bright and settle to a minimum opacity
         const currentTime = this._clock?.getElapsedTime() ?? 0;
-        const elapsed = currentTime - (data.createdAt ?? currentTime);
-        const timeFade = Math.max(0, 1 - elapsed / Board3DManager.CROSS_LINE_FADE_DURATION);
-        const opacityScale = depthOpacity * timeFade;
-
-        // Skip drawing if fully faded
-        if (opacityScale <= 0) continue;
+        const createdAt = data.createdAt ?? currentTime;
+        const opacityScale = depthOpacity * this._crossLineFade(currentTime - createdAt);
 
         const tubeGroup = Board3DManager._glowTube(from, to, color, 0.03, 0.12, true, opacityScale);
         this.branchLineGroup.add(tubeGroup);
-
-        // Track this cross-line mesh for efficient opacity updates in animation loop
-        this._crossLineMeshes.push({
-          group: tubeGroup,
-          dataIndex: this._branchLineData.indexOf(data),
-          baseOpacity: depthOpacity,
-        });
+        this._crossLineMeshes.push({ group: tubeGroup, createdAt, baseOpacity: depthOpacity });
 
       } else if (data.type === 'timetravel' && data.square !== undefined && data.targetTurnIndex !== undefined) {
         // Time travel: vertical line down then horizontal to new timeline
@@ -2799,27 +1940,9 @@ class Board3DManager implements IBoard3D {
     this._rebuildBranchLines();
   }
 
-  /** Remove fully faded cross-timeline lines from data and scene */
-  private _cleanupFadedCrossLines(currentTime: number): void {
-    // Find indices of cross lines that have fully faded
-    const indicesToRemove: number[] = [];
-    for (let i = this._branchLineData.length - 1; i >= 0; i--) {
-      const data = this._branchLineData[i];
-      if (data.type === 'cross' && data.createdAt !== undefined) {
-        const elapsed = currentTime - data.createdAt;
-        if (elapsed >= Board3DManager.CROSS_LINE_FADE_DURATION) {
-          indicesToRemove.push(i);
-        }
-      }
-    }
-
-    // Remove faded lines and rebuild if any were removed
-    if (indicesToRemove.length > 0) {
-      for (const idx of indicesToRemove) {
-        this._branchLineData.splice(idx, 1);
-      }
-      this._rebuildBranchLines();
-    }
+  /** Time-based fade factor for cross-timeline lines (1 when new, settling at a minimum) */
+  private _crossLineFade(elapsed: number): number {
+    return Math.max(Board3DManager.CROSS_LINE_MIN_OPACITY, 1 - elapsed / Board3DManager.CROSS_LINE_FADE_DURATION);
   }
 
   setActiveTimeline(id: number): void {
@@ -2865,13 +1988,8 @@ class Board3DManager implements IBoard3D {
     // Ease out cubic
     const eased = 1 - Math.pow(1 - progress, 3);
 
-    const newTarget = new THREE.Vector3().lerpVectors(
-      this._focusTween.start,
-      this._focusTween.end,
-      eased
-    );
-
-    const delta = new THREE.Vector3().subVectors(newTarget, this.controls.target);
+    const newTarget = this._tempVec3A.lerpVectors(this._focusTween.start, this._focusTween.end, eased);
+    const delta = this._tempVec3B.subVectors(newTarget, this.controls.target);
     this.controls.target.add(delta);
     this.camera.position.add(delta);
 
@@ -2886,14 +2004,6 @@ class Board3DManager implements IBoard3D {
     this.scene.add(new THREE.AmbientLight(0x404060, 0.5));
     const dir = new THREE.DirectionalLight(0xffffff, 0.7);
     dir.position.set(5, 15, 8);
-    dir.castShadow = true;
-    dir.shadow.mapSize.set(2048, 2048);
-    dir.shadow.camera.left = -20;
-    dir.shadow.camera.right = 20;
-    dir.shadow.camera.top = 20;
-    dir.shadow.camera.bottom = -20;
-    dir.shadow.camera.near = 1;
-    dir.shadow.camera.far = 60;
     this.scene.add(dir);
     const p1 = new THREE.PointLight(0x4466ff, 0.5, 50);
     p1.position.set(-12, 8, -8);
@@ -2980,20 +2090,23 @@ class Board3DManager implements IBoard3D {
     return tex;
   }
 
-  /* text sprite helper */
-  static _textSprite(text: string, color: string): Sprite {
-    const c = document.createElement('canvas');
-    c.width = 64;
-    c.height = 64;
-    const ctx = c.getContext('2d')!;
-    ctx.font = 'bold 48px sans-serif';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillStyle = color;
-    ctx.fillText(text, 32, 32);
-    return new THREE.Sprite(
-      new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(c), transparent: true })
-    );
+  /* board coordinate label sprite (texture/material shared across all boards) */
+  static _labelSprite(text: string): Sprite {
+    let mat = labelMaterialCache.get(text);
+    if (!mat) {
+      const c = document.createElement('canvas');
+      c.width = 64;
+      c.height = 64;
+      const ctx = c.getContext('2d')!;
+      ctx.font = '600 44px system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillStyle = '#8a8ac0';
+      ctx.fillText(text, 32, 34);
+      mat = new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(c), transparent: true, depthWrite: false });
+      labelMaterialCache.set(text, mat);
+    }
+    return new THREE.Sprite(mat);
   }
 
   /* glow tube (static helper) */
@@ -3082,6 +2195,12 @@ class Board3DManager implements IBoard3D {
     const s2 = new THREE.Mesh(sg.clone(), sm.clone());
     s2.position.copy(to);
     group.add(s2);
+    // Remember unscaled opacities so fades can rescale without compounding
+    group.traverse((obj: Object3D) => {
+      const mat = (obj as Mesh).material as Material | undefined;
+      if (mat) mat.userData.baseOpacity = opacityScale > 0 ? mat.opacity / opacityScale : 0;
+    });
+    group.userData.opacityScale = opacityScale;
     return group;
   }
 
@@ -3118,7 +2237,6 @@ class Board3DManager implements IBoard3D {
     // Sort by xOffset for clarity
     positions.sort((a, b) => a.xOffset - b.xOffset);
 
-    console.log('=== TIMELINE POSITIONS DEBUG ===');
     console.table(positions);
 
     // Check for duplicates
@@ -3127,10 +2245,8 @@ class Board3DManager implements IBoard3D {
     if (duplicates.length > 0) {
       console.error('[DUPLICATE_POSITIONS] Found timelines at same xOffset!', duplicates);
     } else {
-      console.log('[POSITIONS_OK] All timelines have unique xOffset values');
     }
 
-    console.log('================================');
   }
 
   private _onKeyUp(e: KeyboardEvent): void {
@@ -3232,9 +2348,13 @@ class Board3DManager implements IBoard3D {
     for (const key in this.timelineCols) {
       allMeshes = allMeshes.concat(this.timelineCols[key].getAllSquareMeshes());
     }
-    const hits = this.raycaster.intersectObjects(allMeshes);
-    if (hits.length > 0 && this.onSquareClick) {
-      const ud = hits[0].object.userData;
+    const isShown = (obj: Object3D | null): boolean => {
+      for (let o = obj; o; o = o.parent) if (!o.visible) return false;
+      return true;
+    };
+    const hit = this.raycaster.intersectObjects(allMeshes).find((h) => isShown(h.object));
+    if (hit && this.onSquareClick) {
+      const ud = hit.object.userData;
       this.onSquareClick({
         timelineId: ud.timelineId as number,
         square: ud.square as string,
@@ -3340,92 +2460,40 @@ class Board3DManager implements IBoard3D {
       this._lastCameraTarget.copy(this.controls.target);
     }
 
-    // Particle animation - THROTTLED to every N frames to reduce CPU load
-    // Original: 400 particles * Math.sin() every frame = expensive
-    // Optimized: Update every 3 frames, still looks smooth
-    this._particleAnimFrame++;
-    if (this.particleSystem && this._particleAnimFrame >= Board3DManager.PARTICLE_ANIM_INTERVAL) {
-      this._particleAnimFrame = 0;
-      const pa = (this.particleSystem.geometry.attributes.position as BufferAttribute)
-        .array as Float32Array;
-      // Scale movement by interval to maintain visual speed
-      const moveFactor = 0.001 * Board3DManager.PARTICLE_ANIM_INTERVAL;
-      for (let i = 1; i < pa.length; i += 3) {
-        pa[i] += Math.sin(t * 0.5 + i) * moveFactor;
+    // Ambient motion (starfield drift, glow pulse) runs at a capped rate so an idle
+    // scene costs a fraction of a full-rate render loop
+    if (!this._reducedMotion && t - this._lastAmbientTime >= Board3DManager.AMBIENT_INTERVAL) {
+      this._lastAmbientTime = t;
+      if (this.particleSystem) {
+        this.particleSystem.rotation.y = t * 0.006;
+        this.particleSystem.position.y = Math.sin(t * 0.15) * 0.4;
       }
-      this.particleSystem.geometry.attributes.position.needsUpdate = true;
-      this.particleSystem.rotation.y = t * 0.006;
-      this._needsRender = true;
-    }
-
-    // Pulse effects only need render every ~100ms, not every frame
-    const shouldPulse = t - this._lastRenderTime > 0.1;
-    if (shouldPulse && (this.branchLineGroup?.children.length || Object.keys(this.timelineCols).length > 0)) {
-      const pulse = 0.7 + 0.3 * Math.sin(t * 2);
-      this.branchLineGroup?.traverse((child: Object3D) => {
-        const mesh = child as Mesh;
-        if (mesh.isMesh && mesh.material && (mesh.material as Material).opacity <= 0.12) {
-          (mesh.material as Material).opacity = 0.1 * pulse;
-        }
-      });
-
-      // Pulse inter-layer lines per timeline
-      for (const key in this.timelineCols) {
-        this.timelineCols[key].interLayerGroup.traverse((child: Object3D) => {
-          const mesh = child as Mesh;
-          if (mesh.isMesh && mesh.material && (mesh.material as Material).opacity <= 0.12) {
-            (mesh.material as Material).opacity = 0.1 * pulse;
-          }
-        });
+      // Pulse the soft outer glow of inter-timeline lines
+      const pulse = 0.75 + 0.25 * Math.sin(t * 2);
+      for (const tube of this.branchLineGroup?.children ?? []) {
+        const outer = tube.children[0] as Mesh | undefined;
+        const mat = outer?.material as Material | undefined;
+        if (mat) mat.opacity = mat.userData.baseOpacity * (tube.userData.opacityScale ?? 1) * pulse;
       }
       this._needsRender = true;
     }
 
-    // Cross-timeline line fade-out animation
+    // Cross-timeline lines fade out after they appear (only while still fading)
     if (this._crossLineMeshes.length > 0) {
-      let needsCleanup = false;
-
+      let fading = false;
       for (const entry of this._crossLineMeshes) {
-        const data = this._branchLineData[entry.dataIndex];
-        if (!data || data.type !== 'cross') continue;
-
-        const elapsed = t - (data.createdAt ?? t);
-        // Fade from 1.0 down to MIN_OPACITY, never fully disappear
-        const timeFade = Math.max(
-          Board3DManager.CROSS_LINE_MIN_OPACITY,
-          1 - elapsed / Board3DManager.CROSS_LINE_FADE_DURATION
-        );
-        const targetOpacity = entry.baseOpacity * timeFade;
-        // Lines persist forever at minimum opacity - no cleanup needed
-
-        // Update opacity on all meshes in the glow tube group
-        entry.group.traverse((child: Object3D) => {
-          const mesh = child as Mesh;
-          if (mesh.isMesh && mesh.material) {
-            const mat = mesh.material as MeshBasicMaterial;
-            // Scale relative to the original opacity ratios in _glowTube
-            // Outer glow: 0.1, Mid glow: 0.22, Core: 0.75, Sphere: 0.6
-            if (mat.opacity !== undefined) {
-              // Determine which layer this is based on original opacity range
-              const origBase = mat.userData?.origOpacity ?? mat.opacity;
-              if (!mat.userData?.origOpacity) {
-                mat.userData = mat.userData || {};
-                mat.userData.origOpacity = mat.opacity / entry.baseOpacity;
-              }
-              mat.opacity = mat.userData.origOpacity * targetOpacity;
-            }
-          }
-        });
+        const elapsed = t - entry.createdAt;
+        if (elapsed > Board3DManager.CROSS_LINE_FADE_DURATION + 0.1) continue;
+        fading = true;
+        setTubeOpacity(entry.group, entry.baseOpacity * this._crossLineFade(elapsed));
       }
-      this._needsRender = true;
-      // Lines persist forever at minimum opacity - no cleanup
+      if (fading) this._needsRender = true;
     }
 
     // PERFORMANCE: Only render when dirty flag is set
     // This can save significant GPU/CPU when the scene is static
     if (this._needsRender) {
       this.renderer.render(this.scene, this.camera);
-      this._lastRenderTime = t;
       this._needsRender = false;
     }
   }
@@ -3560,8 +2628,6 @@ class Board3DManager implements IBoard3D {
     this.controls?.target.set(0, 0, 0);
     // Clear object pools when resetting game
     meshPool.clear();
-    // Trim sprite pool to reduce memory (keep some for reuse)
-    spritePool.trim(32);  // Keep ~1 board worth of pieces for quick reuse
   }
 
   /**
@@ -3570,7 +2636,6 @@ class Board3DManager implements IBoard3D {
    * Call this on beforeunload event or when destroying the game instance.
    */
   dispose(): void {
-    console.log('[Board3D] dispose() called - cleaning up resources');
 
     // Set disposed flag to stop animation loop
     this._disposed = true;
@@ -3729,7 +2794,6 @@ class Board3DManager implements IBoard3D {
     this._clock = null;
     this.onSquareClick = null;
 
-    console.log('[Board3D] dispose() complete');
   }
 
   /**
@@ -3744,7 +2808,6 @@ class Board3DManager implements IBoard3D {
     });
 
     if (index < 0 || index >= timelineIds.length) {
-      console.log(`[Board3D] selectBoard: index ${index} out of range (0-${timelineIds.length - 1})`);
       return;
     }
 
@@ -3757,7 +2820,6 @@ class Board3DManager implements IBoard3D {
     // Pan camera to selected board
     this.focusTimeline(timelineId, true);
 
-    console.log(`[Board3D] selectBoard: selected board ${index} (timeline ${timelineId})`);
     this._needsRender = true;
   }
 
@@ -3792,7 +2854,6 @@ class Board3DManager implements IBoard3D {
    */
   zoomInOnSelected(): void {
     if (this._selectedBoardIndex === null) {
-      console.log('[Board3D] zoomInOnSelected: no board selected');
       return;
     }
 
@@ -3823,7 +2884,6 @@ class Board3DManager implements IBoard3D {
 
     this._zoomedIn = true;
     this._needsRender = true;
-    console.log(`[Board3D] zoomInOnSelected: zoomed in on board ${this._selectedBoardIndex}`);
   }
 
   /**
@@ -3861,7 +2921,6 @@ class Board3DManager implements IBoard3D {
 
     this._zoomedIn = false;
     this._needsRender = true;
-    console.log('[Board3D] zoomOut: showing all boards');
   }
 
   /**
@@ -3986,7 +3045,6 @@ class Board3DManager implements IBoard3D {
       }
 
       this._is2DMode = true;
-      console.log(`[Board3D] 2D mode enabled: ${numBoards} boards in ${cols}x${rows} grid, height=${height.toFixed(1)}`);
     } else {
       // Restore board positions
       for (const [id, originalX] of this._pre2DBoardPositions) {
@@ -4022,7 +3080,6 @@ class Board3DManager implements IBoard3D {
       }
 
       this._is2DMode = false;
-      console.log('[Board3D] 2D mode disabled: returning to 3D view');
     }
 
     this._needsRender = true;
@@ -4063,7 +3120,6 @@ class Board3DManager implements IBoard3D {
 
     this._zoomedIn = false;
     this._needsRender = true;
-    console.log(`[Board3D] zoomOutShowAll: showing ${timelineIds.length} boards`);
   }
 }
 

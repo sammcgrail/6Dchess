@@ -18,4 +18,6 @@ dist/
 .idea/
 
 # Subagent raw logs (too large for git - keep FINDINGS.md summary only)
-subagent-logs/agent*.md
+docs/notes/subagent-logs/agent*.md
+test-results/
+playwright-report/
