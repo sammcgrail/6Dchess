@@ -137,6 +137,11 @@ class GameManager {
     this._refreshUi();
 
     document.getElementById('undo')?.addEventListener('click', () => this.undo());
+    // Don't lose a pending autosave when the tab is hidden or closed
+    window.addEventListener('pagehide', () => this._flushAutosave());
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) this._flushAutosave();
+    });
     document.querySelectorAll<HTMLButtonElement>('#mode-row button').forEach((btn) =>
       btn.addEventListener('click', () => this.setMode(btn.dataset.mode as GameMode))
     );
@@ -1636,7 +1641,18 @@ timelines - list timelines`,
     return ok;
   }
 
+  private _autosaveTimer: number | null = null;
+
+  /** Save soon; rapid CPU play coalesces into one write */
   private _autosave(): void {
+    if (this._autosaveTimer !== null) return;
+    this._autosaveTimer = window.setTimeout(() => this._flushAutosave(), 750);
+  }
+
+  private _flushAutosave(): void {
+    if (this._autosaveTimer === null) return;
+    clearTimeout(this._autosaveTimer);
+    this._autosaveTimer = null;
     try {
       localStorage.setItem(SAVE_KEY, JSON.stringify(this.exportState()));
     } catch {
@@ -1645,6 +1661,10 @@ timelines - list timelines`,
   }
 
   private _clearSave(): void {
+    if (this._autosaveTimer !== null) {
+      clearTimeout(this._autosaveTimer);
+      this._autosaveTimer = null;
+    }
     try {
       localStorage.removeItem(SAVE_KEY);
     } catch {
