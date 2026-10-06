@@ -407,6 +407,10 @@ class SpritePool {
 // Global sprite pool instance
 const spritePool = new SpritePool();
 
+// Render-on-demand hook: every TimelineCol mutation asks for a frame. Without it, a board change
+// with no camera motion is only drawn by the ambient animation, which is off under reduced motion.
+let requestRender: () => void = () => {};
+
 // ===============================================================
 // TimelineCol - one per timeline
 // ===============================================================
@@ -615,6 +619,7 @@ export class TimelineCol implements ITimelineCol {
 
   /** Render pieces on the current board, updating only squares whose piece changed */
   render(position: Board): void {
+    requestRender();
     const next = new Map<string, string>();
     for (let r = 0; r < 8; r++) {
       for (let c = 0; c < 8; c++) {
@@ -688,6 +693,7 @@ export class TimelineCol implements ITimelineCol {
   /** Mark the king in check (null clears) */
   setCheckSquare(index: number | null): void {
     if (index === this.checkSquare) return;
+    requestRender();
     const previous = this.checkSquare;
     this.checkSquare = index;
     if (previous !== null) this._restoreSquare(previous);
@@ -706,6 +712,7 @@ export class TimelineCol implements ITimelineCol {
   /** Highlight the square under the pointer (null clears) */
   setHover(index: number | null): void {
     if (index === this.hoveredSquare) return;
+    requestRender();
     const previous = this.hoveredSquare;
     this.hoveredSquare = index;
     if (previous !== null) this._restoreSquare(previous);
@@ -713,6 +720,7 @@ export class TimelineCol implements ITimelineCol {
   }
 
   select(sq: string): void {
+    requestRender();
     this.clearHighlights();
     const pos = this._fromSq(sq);
     this.selectedSquare = pos.r * 8 + pos.c;
@@ -720,6 +728,7 @@ export class TimelineCol implements ITimelineCol {
   }
 
   showLegalMoves(moves: ChessMove[], position: Board): void {
+    requestRender();
     for (let i = 0; i < moves.length; i++) {
       const p = this._fromSq(moves[i].to);
       const hasPiece = position[p.r][p.c] !== null;
@@ -738,6 +747,7 @@ export class TimelineCol implements ITimelineCol {
 
   /** Slide the piece now standing on `to` from `from` (call after render) */
   animatePieceMove(from: string, to: string): void {
+    requestRender();
     const a = this._fromSq(from);
     const b = this._fromSq(to);
     const sprite = this._spriteMap.get(`${b.r},${b.c}`);
@@ -748,6 +758,7 @@ export class TimelineCol implements ITimelineCol {
   }
 
   showLastMove(from: string, to: string): void {
+    requestRender();
     // Return old highlights to pool
     for (let i = 0; i < this.lastMoveHL.length; i++) {
       meshPool.release(this.lastMoveHL[i] as PooledMesh);
@@ -773,6 +784,7 @@ export class TimelineCol implements ITimelineCol {
   private cpuPreviewMeshes: Mesh[] = [];
 
   showCpuMovePreview(from: string, to: string, isWhite: boolean, isTimeTravel: boolean = false): void {
+    requestRender();
     this.clearCpuMovePreview();
 
     const fromPos = this._fromSq(from);
@@ -849,6 +861,7 @@ export class TimelineCol implements ITimelineCol {
   }
 
   clearCpuMovePreview(): void {
+    requestRender();
     for (const mesh of this.cpuPreviewMeshes) {
       this.group.remove(mesh);
       // Dispose materials and geometry
@@ -875,6 +888,7 @@ export class TimelineCol implements ITimelineCol {
   }
 
   clearHighlights(): void {
+    requestRender();
     if (this.selectedSquare !== null) {
       const previous = this.selectedSquare;
       this.selectedSquare = null;
@@ -888,6 +902,7 @@ export class TimelineCol implements ITimelineCol {
 
   /* Cross-timeline movement indicators - enhanced with vertical beams */
   showCrossTimelineTarget(sq: string, isCapture: boolean): void {
+    requestRender();
     const pos = this._fromSq(sq);
     // Use shared geometry and material via pool
     const geo = isCapture
@@ -944,6 +959,7 @@ export class TimelineCol implements ITimelineCol {
   }
 
   clearCrossTimelineTargets(): void {
+    requestRender();
     for (const mesh of this.crossTimelineTargets) {
       // Some meshes are pooled, some are not (beams, capture rings)
       if ((mesh as PooledMesh)._poolType) {
@@ -961,6 +977,7 @@ export class TimelineCol implements ITimelineCol {
 
   /** Add a glowing border around the entire board to indicate it's a valid target */
   showBoardGlowBorder(color: number = 0xaa44ff): void {
+    requestRender();
     this._clearBoardGlowBorder();
 
     // Create 4 edge beams around the board perimeter
@@ -1029,6 +1046,7 @@ export class TimelineCol implements ITimelineCol {
 
   /* Time travel target indicators (on history layers) */
   showTimeTravelTarget(turnIndex: number, sq: string, isCapture: boolean): void {
+    requestRender();
     // turnIndex 0 = most recent history layer, which is at historyLayers[0]
     if (turnIndex < 0 || turnIndex >= this.historyLayers.length) return;
 
@@ -1071,6 +1089,7 @@ export class TimelineCol implements ITimelineCol {
   }
 
   clearTimeTravelTargets(): void {
+    requestRender();
     // Return all time travel target meshes to pool
     for (const mesh of this.timeTravelTargets) {
       meshPool.release(mesh as PooledMesh);
@@ -1092,6 +1111,7 @@ export class TimelineCol implements ITimelineCol {
   private static MAX_MOVE_LINES = 8;  // Only show last 8 moves on top board
 
   addMoveLine(fromSq: string, toSq: string, isWhite: boolean): void {
+    requestRender();
     const a = this._sqToWorld(fromSq, 0.09);
     const b = this._sqToWorld(toSq, 0.09);
     a.x -= this.xOffset;
@@ -1110,6 +1130,7 @@ export class TimelineCol implements ITimelineCol {
 
   /* history snapshot */
   addSnapshot(position: Board, moveFrom: string, moveTo: string, isWhite: boolean): void {
+    requestRender();
     const layerGroup = this._makeHistoryBoard(position);
     Object.assign(layerGroup.userData, { moveFrom, moveTo, isWhite });
     // If in 2D mode, hide the new layer immediately
@@ -1241,11 +1262,13 @@ export class TimelineCol implements ITimelineCol {
   private _highlighted = false;
 
   setActive(active: boolean): void {
+    requestRender();
     this._active = active;
     this._applyBaseGlow();
   }
 
   setHighlighted(highlighted: boolean): void {
+    requestRender();
     this._highlighted = highlighted;
     this._applyBaseGlow();
   }
@@ -1262,6 +1285,7 @@ export class TimelineCol implements ITimelineCol {
 
   /** Set board state glow (checkmate = red, draw = amber/orange, none = clear) */
   setBoardGlow(state: 'checkmate' | 'draw' | 'none'): void {
+    requestRender();
     if (state === this._boardGlowState) return;
     this._boardGlowState = state;
     const glowColor = state === 'checkmate' ? CHECKMATE_GLOW : state === 'draw' ? DRAW_GLOW : null;
@@ -1273,6 +1297,7 @@ export class TimelineCol implements ITimelineCol {
   }
 
   clearAll(): void {
+    requestRender();
     this._clearPieceSprites();
 
     // Clear history layers and dispose of their contents
@@ -1302,6 +1327,7 @@ export class TimelineCol implements ITimelineCol {
   }
 
   destroy(): void {
+    requestRender();
     this.clearAll();
     this.squareMat.dispose();
     this.squares.dispose();
@@ -1321,6 +1347,7 @@ export class TimelineCol implements ITimelineCol {
    * Keep: board squares, pieces, move indicators, cross-timeline highlights.
    */
   set2DMode(enabled: boolean): void {
+    requestRender();
     this._is2DMode = enabled;
     // Toggle visibility of history layers
     for (const layer of this.historyLayers) {
@@ -1522,6 +1549,7 @@ class Board3DManager implements IBoard3D {
     onSquareClick: (info: { timelineId: number; square: string; turn: number; isHistory: boolean }) => void
   ): void {
     this.onSquareClick = onSquareClick;
+    requestRender = () => this.markDirty();
     const container = document.getElementById(containerId);
     if (!container) {
       throw new Error(`Container element '${containerId}' not found`);
@@ -1693,6 +1721,7 @@ class Board3DManager implements IBoard3D {
       this._pieceTexture.bind(this)
     );
     this.timelineCols[id] = col;
+    this._needsRender = true;
     return col;
   }
 
@@ -2654,6 +2683,7 @@ class Board3DManager implements IBoard3D {
       this.timelineCols[key].destroy();
     }
     this.timelineCols = {};
+    this._needsRender = true;
     if (this.branchLineGroup) clearGroup(this.branchLineGroup);
     // Clear branch line metadata and cross-line mesh tracking
     this._branchLineData = [];

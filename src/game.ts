@@ -846,6 +846,9 @@ timelines - list timelines`,
       const to = moveMatch[2];
       const promotion = moveMatch[3] as PieceType | undefined;
 
+      if (this._isCpuControlled(tl.chess.turn())) {
+        return { success: false, message: `The CPU plays ${tl.chess.turn() === 'w' ? 'White' : 'Black'} here` };
+      }
       const moves = tl.chess.moves({ verbose: true }) as ChessMove[];
       const move = moves.find(m => m.from === from && m.to === to);
       if (!move) {
@@ -916,6 +919,7 @@ timelines - list timelines`,
       col?.render(board);
       col?.setCheckSquare(null);
     }
+    Board3D.markDirty();
 
     this._updateMoveSlider();
     this.updateStatus();
@@ -1035,9 +1039,13 @@ timelines - list timelines`,
 
   setActiveTimeline(id: number, autoFocus: boolean = true): void {
     const previousId = this.activeTimelineId;
+    const wasReviewing = this.viewingMoveIndex !== null;
     this.activeTimelineId = id;
     this.viewingMoveIndex = null; // Reset to current position when switching timelines
+    // The board that was being reviewed still shows a past position; bring it back to the present
+    if (wasReviewing && this.timelines[previousId]) this.renderTimeline(previousId);
     Board3D.setActiveTimeline(id);
+    Board3D.markDirty();
     this.clearSelection();
     this.updateStatus();
     this.updateMoveList();
@@ -1576,17 +1584,67 @@ timelines - list timelines`,
     };
   }
 
-  /** Rebuild the game (data and 3D scene) from exportState() output. Returns false if invalid. */
+  /** Rebuild the game (data and 3D scene) from exportState() output. Returns false if invalid.
+   * Nothing is touched unless the state validates; if the rebuild still fails midway (a partially
+   * corrupt save), the bad save is dropped and a fresh game is started so the scene is never half-built. */
   importState(state: SavedGame): boolean {
-    if (!state || state.version !== 1 || !Array.isArray(state.timelines) || state.timelines.length === 0) return false;
+    let rebuilt: Record<number, TimelineData>;
+    try {
+      const parsed = this._parseState(state);
+      if (!parsed) return false;
+      rebuilt = parsed;
+    } catch (error) {
+      console.warn('[importState] Rejected saved state:', error);
+      return false;
+    }
+
+    this.cpuStop();
+    this._stopExamplePlay();
+    this.clearSelection();
+    try {
+      Board3D.clearAll();
+      this.timelines = rebuilt;
+      this.nextTimelineId = state.nextTimelineId;
+      this.cpuGlobalTurn = state.cpuGlobalTurn;
+      this.viewingMoveIndex = null;
+      this._lastMoveListHtml = '';
+      this._lastTimelineStructure = '';
+      document.getElementById('game-end-toast')?.remove();
+
+      for (const tl of Object.values(rebuilt).sort((a, b) => a.id - b.id)) {
+        Board3D.createTimeline(tl.id, tl.xOffset);
+        this._buildHistoryLayers(tl);
+        this.renderTimeline(tl.id);
+      }
+      Board3D.importLines(state.lines ?? []);
+      if (Board3D.is2DMode()) {
+        Board3D.set2DMode(false);
+        Board3D.set2DMode(true);
+      }
+      this.setActiveTimeline(rebuilt[state.activeTimelineId] ? state.activeTimelineId : 0, true);
+      this._refreshUi();
+      return true;
+    } catch (error) {
+      console.warn('[importState] Saved game is corrupt; starting a new game:', error);
+      this.reset();
+      return false;
+    }
+  }
+
+  /** Validate saved state and build its timeline data, without touching the current game */
+  private _parseState(state: SavedGame): Record<number, TimelineData> | null {
+    if (!state || state.version !== 1 || !Array.isArray(state.timelines) || state.timelines.length === 0) return null;
+    if (!Number.isInteger(state.nextTimelineId) || (state.cpuGlobalTurn !== 'w' && state.cpuGlobalTurn !== 'b')) return null;
     const rebuilt: Record<number, TimelineData> = {};
     for (const saved of state.timelines) {
+      if (!saved || !Number.isInteger(saved.id) || rebuilt[saved.id]) return null;
+      if (!Array.isArray(saved.snapshots) || !Array.isArray(saved.moveHistory)) return null;
       const chess = new Chess();
-      if (!chess.load(saved.fen) || saved.snapshots.length !== saved.moveHistory.length + 1) return false;
+      if (!chess.load(saved.fen) || saved.snapshots.length !== saved.moveHistory.length + 1) return null;
       const snapshots: Snapshot[] = [];
       for (const fen of saved.snapshots) {
         const snapChess = new Chess();
-        if (!snapChess.load(fen)) return false;
+        if (!snapChess.load(fen)) return null;
         snapshots.push(this._cloneBoard(snapChess));
       }
       rebuilt[saved.id] = {
@@ -1600,32 +1658,8 @@ timelines - list timelines`,
         snapshots,
       };
     }
-
-    this.cpuStop();
-    this._stopExamplePlay();
-    this.clearSelection();
-    Board3D.clearAll();
-    this.timelines = rebuilt;
-    this.nextTimelineId = state.nextTimelineId;
-    this.cpuGlobalTurn = state.cpuGlobalTurn;
-    this.viewingMoveIndex = null;
-    this._lastMoveListHtml = '';
-    this._lastTimelineStructure = '';
-    document.getElementById('game-end-toast')?.remove();
-
-    for (const tl of Object.values(rebuilt).sort((a, b) => a.id - b.id)) {
-      Board3D.createTimeline(tl.id, tl.xOffset);
-      this._buildHistoryLayers(tl);
-      this.renderTimeline(tl.id);
-    }
-    Board3D.importLines(state.lines ?? []);
-    if (Board3D.is2DMode()) {
-      Board3D.set2DMode(false);
-      Board3D.set2DMode(true);
-    }
-    this.setActiveTimeline(rebuilt[state.activeTimelineId] ? state.activeTimelineId : 0, true);
-    this._refreshUi();
-    return true;
+    // The fresh-game fallback and the UI assume the main timeline exists
+    return rebuilt[0] ? rebuilt : null;
   }
 
   /** Remember the position before a move so it can be undone */
@@ -1644,6 +1678,8 @@ timelines - list timelines`,
     const ok = this.importState(previous);
     // Keep playing against the CPU after taking a move back
     if (ok && mode === 'vs-cpu') this.setMode('vs-cpu');
+    // Persist the taken-back position, or a reload would bring the undone move back
+    if (ok) this._autosave();
     return ok;
   }
 
@@ -1678,20 +1714,31 @@ timelines - list timelines`,
     }
   }
 
-  /** Restore the autosaved game, if any. Returns true when a game was restored. */
+  /** Restore the autosaved game, if any. Returns true when a game is set up (restored, or
+   * replaced by a fresh game after a corrupt save), false when the caller should start one. */
   private _restoreSave(): boolean {
+    let state: SavedGame;
     try {
       const raw = localStorage.getItem(SAVE_KEY);
       if (!raw) return false;
-      const state = JSON.parse(raw) as SavedGame;
-      const hasMoves = state.timelines?.some((tl) => tl.moveHistory.length > 0);
-      return hasMoves ? this.importState(state) : false;
+      state = JSON.parse(raw) as SavedGame;
     } catch {
+      this._clearSave();
       return false;
     }
+    const hasMoves =
+      Array.isArray(state?.timelines) &&
+      state.timelines.some((tl) => Array.isArray(tl?.moveHistory) && tl.moveHistory.length > 0);
+    if (!hasMoves) return false;
+    if (this.importState(state)) return true;
+    // Never retry a save that can't be restored. A rebuild that failed midway has already
+    // started a fresh game (timeline 0 exists); a save rejected up front left everything untouched.
+    this._clearSave();
+    return this.timelines[0] !== undefined;
   }
 
   private _refreshUi(): void {
+    Board3D.markDirty();
     this.updateStatus();
     this.updateMoveList();
     this.updateTimelineList();
@@ -1772,6 +1819,14 @@ timelines - list timelines`,
       return;
     }
 
+    // The active board under review keeps showing the reviewed position (its history only grows)
+    if (tlId === this.activeTimelineId && this.viewingMoveIndex !== null && tl.snapshots[this.viewingMoveIndex]) {
+      col.render(this._getSnapshotBoard(tl.snapshots[this.viewingMoveIndex]));
+      col.setCheckSquare(null);
+      Board3D.markDirty();
+      return;
+    }
+
     const board = tl.chess.board();
     // Count pieces on the board
     let pieceCount = 0;
@@ -1799,6 +1854,7 @@ timelines - list timelines`,
     } else {
       col.setBoardGlow('none');
     }
+    Board3D.markDirty();
   }
 
   private _kingSquareIndex(board: Board, color: PieceColor): number | null {
@@ -1828,11 +1884,13 @@ timelines - list timelines`,
     }
     this.selected = null;
     this.selectedTimelineId = null;
-    // Dismiss a promotion picker that no longer matches the board
-    if (this.pendingPromotion) {
+    // Dismiss a promotion picker that no longer matches the board. A CPU move can't touch the
+    // promoting board (it's the human's turn there), so the human's open picker survives it.
+    if (this.pendingPromotion && !this.cpuCommitting) {
       this.pendingPromotion = null;
       document.getElementById('promotion-picker')?.remove();
     }
+    Board3D.markDirty();
   }
 
   /** Show cross-timeline target indicators in other timelines */
@@ -2450,6 +2508,8 @@ timelines - list timelines`,
 
   /** Switch between two humans, human (White) vs CPU, and CPU vs CPU */
   setMode(mode: GameMode): void {
+    // Picking a mode takes over from the demo
+    if (this._examplePlaying) this._stopExamplePlay();
     if (mode === 'human') {
       this.cpuStop();
     } else {
@@ -2584,7 +2644,10 @@ timelines - list timelines`,
       try {
         const tlId = this._cpuSelectBestTimeline(this.cpuTurnQueue);
         this.cpuTurnQueue = this.cpuTurnQueue.filter((id) => id !== tlId);
-        const humanSelection = this.selected !== null ? { tl: this.selectedTimelineId!, sq: this.selected } : null;
+        // (Not while a promotion picker is open: re-selecting would dismiss it)
+        const humanSelection = this.selected !== null && !this.pendingPromotion
+          ? { tl: this.selectedTimelineId!, sq: this.selected }
+          : null;
         const moved = await this._cpuMakeMove(tlId, generation);
         // A CPU reply clears the selection; restore the human's piece with fresh targets
         if (moved && humanSelection && generation === this.cpuGeneration && this.selected === null) {
