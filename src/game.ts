@@ -137,6 +137,11 @@ class GameManager {
     this._refreshUi();
 
     document.getElementById('undo')?.addEventListener('click', () => this.undo());
+    // Click a move to review the position after it; clicking the last move returns to the present
+    document.getElementById('moves')?.addEventListener('click', (e) => {
+      const ply = (e.target as HTMLElement).closest<HTMLElement>('.move[data-ply]')?.dataset.ply;
+      if (ply) this.goToMove(Number(ply));
+    });
     // Don't lose a pending autosave when the tab is hidden or closed
     window.addEventListener('pagehide', () => this._flushAutosave());
     document.addEventListener('visibilitychange', () => {
@@ -906,7 +911,9 @@ timelines - list timelines`,
       // Render the board at that snapshot
       const snapshot = tl.snapshots[moveIndex];
       const board = this._getSnapshotBoard(snapshot);
-      Board3D.getTimeline(this.activeTimelineId)?.render(board);
+      const col = Board3D.getTimeline(this.activeTimelineId);
+      col?.render(board);
+      col?.setCheckSquare(null);
     }
 
     this._updateMoveSlider();
@@ -916,27 +923,16 @@ timelines - list timelines`,
 
   private _highlightCurrentMoveInList(): void {
     const movesEl = document.getElementById('moves');
-    if (!movesEl) return;
-    const pairs = movesEl.querySelectorAll('.move-pair');
     const tl = this.timelines[this.activeTimelineId];
-    if (!tl) return;
-
-    const totalMoves = tl.moveHistory.length;
-    const viewingMove = this.viewingMoveIndex !== null ? this.viewingMoveIndex : totalMoves;
-
-    pairs.forEach((pair, idx) => {
-      const pairStartMove = idx * 2 + 1; // Move 1 is at pair 0
-      const pairEndMove = idx * 2 + 2;
-
-      if (viewingMove >= pairStartMove && viewingMove <= pairEndMove) {
-        pair.classList.add('current-move');
-      } else if (viewingMove < pairStartMove) {
-        pair.classList.add('future-move');
-      } else {
-        pair.classList.remove('current-move', 'future-move');
-      }
+    if (!movesEl || !tl) return;
+    const viewing = this.viewingMoveIndex ?? tl.moveHistory.length;
+    movesEl.querySelectorAll<HTMLElement>('.move[data-ply]').forEach((el) => {
+      const ply = Number(el.dataset.ply);
+      el.classList.toggle('current', ply === viewing && this.viewingMoveIndex !== null);
+      el.classList.toggle('future', ply > viewing);
     });
   }
+
 
   cycleTimeline(direction: number): void {
     const ids = Object.keys(this.timelines).map(Number).sort((a, b) => a - b);
@@ -1068,6 +1064,12 @@ timelines - list timelines`,
       } else {
         Board3D.focusTimeline(tlId, true);
       }
+      return;
+    }
+
+    // While reviewing an earlier position, a board click first returns to the present
+    if (this.viewingMoveIndex !== null && !info.isHistory && info.timelineId === this.activeTimelineId) {
+      this.goToMove(-1);
       return;
     }
 
@@ -1786,6 +1788,7 @@ timelines - list timelines`,
     }
 
     col.render(board);
+    col.setCheckSquare(tl.chess.in_check() ? this._kingSquareIndex(board, tl.chess.turn()) : null);
 
     // Update board glow based on game state
     if (tl.chess.in_checkmate()) {
@@ -1795,6 +1798,16 @@ timelines - list timelines`,
     } else {
       col.setBoardGlow('none');
     }
+  }
+
+  private _kingSquareIndex(board: Board, color: PieceColor): number | null {
+    for (let r = 0; r < 8; r++) {
+      for (let c = 0; c < 8; c++) {
+        const p = board[r][c];
+        if (p && p.type === 'k' && p.color === color) return r * 8 + c;
+      }
+    }
+    return null;
   }
 
   clearSelection(): void {
@@ -2019,8 +2032,8 @@ timelines - list timelines`,
       html +=
         '<div class="move-pair">' +
         '<span class="move-number">' + num + '.</span>' +
-        this._formatMoveWithTooltip(white) +
-        this._formatMoveWithTooltip(black) + '</div>';
+        this._formatMoveWithTooltip(white, i + 1) +
+        this._formatMoveWithTooltip(black, i + 2) + '</div>';
     }
     // Only update DOM if content changed (avoids unnecessary re-renders)
     if (html !== this._lastMoveListHtml) {
@@ -2028,11 +2041,13 @@ timelines - list timelines`,
       movesEl.scrollTop = movesEl.scrollHeight;
       this._lastMoveListHtml = html;
     }
+    this._highlightCurrentMoveInList();
   }
 
   /** Format a move SAN with tooltips for cross-timeline/time-travel notation */
-  private _formatMoveWithTooltip(san: string): string {
+  private _formatMoveWithTooltip(san: string, ply = 0): string {
     if (!san) return '<span class="move"></span>';
+    const plyAttr = ply ? ` data-ply="${ply}"` : '';
 
     // Cross-timeline moves: Qd4→T2 (piece moves TO timeline) or Qd4←T1 (piece arrives FROM timeline)
     // Time travel moves: Qd4⟳T3 (departure) or Qd4⟳←T1 (arrival via time travel)
@@ -2070,9 +2085,9 @@ timelines - list timelines`,
     }
 
     if (tooltip) {
-      return `<span class="${cssClass}" title="${tooltip}">${san}</span>`;
+      return `<span class="${cssClass}"${plyAttr} title="${tooltip}">${san}</span>`;
     }
-    return `<span class="${cssClass}">${san}</span>`;
+    return `<span class="${cssClass}"${plyAttr}>${san}</span>`;
   }
 
   updateTimelineList(): void {

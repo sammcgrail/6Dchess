@@ -1985,3 +1985,24 @@ summary:focus-visible {
     font-weight: 600;
     cursor: pointer;
 }
+
+/* Clickable moves for reviewing earlier positions */
+.move[data-ply] {
+    cursor: pointer;
+    border-radius: 4px;
+    padding: 0 0.2rem;
+    transition: background 0.12s;
+}
+
+.move[data-ply]:hover {
+    background: rgba(120, 140, 230, 0.22);
+}
+
+.move.current {
+    background: rgba(255, 190, 90, 0.25);
+    color: #ffd38a;
+}
+
+.move.future {
+    opacity: 0.35;
+}
