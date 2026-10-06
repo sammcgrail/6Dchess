@@ -25,13 +25,14 @@ jobs:
       - name: Unit tests
         run: npm run test:unit
 
-      - name: Install Playwright Chromium
-        run: npx playwright install --with-deps chromium
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium webkit
 
       - name: End-to-end tests
         run: npm run test:e2e
         env:
           CI: 'true'
+          PW_WEBKIT: '1'  # also run the mobile layout checks in WebKit on an iPhone profile
 
       - name: Upload screenshots
         if: always()
