@@ -3,7 +3,7 @@ import { clickSquare, collectErrors, move, openGame } from './helpers';
 
 // With prefers-reduced-motion the ambient animation is off, so nothing redraws the scene on a
 // timer: every board change must request a frame itself or it stays invisible.
-test.use({ reducedMotion: 'reduce' });
+test.beforeEach(({ page }) => page.emulateMedia({ reducedMotion: 'reduce' }));
 
 const frames = (page: Page) =>
   page.evaluate(() => (window as any).ChessApp.Board3D.renderer.info.render.frame as number);
@@ -39,7 +39,7 @@ test('reduced motion: the board redraws after New Game, Undo, review and a 2D se
   await expectRedraw(page, () => page.locator('#moves .move[data-ply="1"]').click());
   await expectRedraw(page, () => page.locator('#moves .move[data-ply="2"]').click());
 
-  await page.locator('#2d-mode-toggle').click();
+  await page.locator('[id="2d-mode-toggle"]').click();
   await expectRedraw(page, () => clickSquare(page, 0, 'g1'));
   await expectRedraw(page, () => clickSquare(page, 0, 'g1'));
   expect(errors).toEqual([]);

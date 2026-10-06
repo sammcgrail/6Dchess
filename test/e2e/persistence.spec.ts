@@ -93,6 +93,7 @@ for (const [name, save] of [
   test(`a partially corrupt save (${name}) starts a fresh game cleanly`, async ({ page }) => {
     const errors = collectErrors(page);
     await openGame(page);
+    const freshSceneSize = await page.evaluate(() => (window as any).ChessApp.Board3D.scene.children.length);
     await page.evaluate((s) => localStorage.setItem('6dchess-save', JSON.stringify(s)), save);
     await page.reload();
     await page.waitForFunction(() => !!(window as any).Game && !!document.querySelector('#scene-container canvas'));
@@ -103,8 +104,11 @@ for (const [name, save] of [
     expect(await page.evaluate(() => Object.keys((window as any).ChessApp.Board3D.timelineCols))).toEqual(['0']);
     expect(await page.evaluate(() => (window as any).ChessApp.Board3D.getTimeline(0).pieceSpriteCount())).toBe(32);
     await expect(page.locator('#timeline-list .tl-item')).toHaveCount(1);
+    // No half-built board left behind in the scene
+    expect(await page.evaluate(() => (window as any).ChessApp.Board3D.scene.children.length)).toBe(freshSceneSize);
     // The bad save is gone, and the fresh game is playable
-    expect(await page.evaluate(() => localStorage.getItem('6dchess-save') ?? '')).not.toContain('"e4"');
+    const saved = await page.evaluate(() => localStorage.getItem('6dchess-save'));
+    expect(saved === null || JSON.parse(saved).timelines.every((t: any) => t.moveHistory.length === 0)).toBe(true);
     await move(page, 0, 'd2', 'd4');
     expect((await boards(page))[0].moveCount).toBe(1);
     expect(errors).toEqual([]);

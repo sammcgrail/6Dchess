@@ -89,3 +89,57 @@ test('vs CPU: CPU replies do not steal the active board or the human selection',
   expect((await boards(page)).find((b) => b.timelineId === 1)!.turn).toBe('b');
   expect(errors).toEqual([]);
 });
+
+test('vs CPU: a CPU move on another board keeps the human promotion picker open', async ({ page }) => {
+  const errors = collectErrors(page);
+  await openGame(page);
+  // Main: White to move with a pawn about to promote. Branch 1: Black (the CPU) to move.
+  await page.evaluate(() => {
+    const g = (window as any).Game;
+    const tl = (id: number, fen: string, x: number) => ({
+      id, name: id ? 'Branch 1' : 'Main', parentId: id ? 0 : null, branchTurn: id ? 0 : -1, xOffset: x,
+      fen, moveHistory: [], snapshots: [fen],
+    });
+    g.importState({
+      version: 1, activeTimelineId: 0, nextTimelineId: 2, cpuGlobalTurn: 'w', lines: [],
+      timelines: [tl(0, '7k/4P3/8/8/8/8/8/K7 w - - 0 1', 0), tl(1, '7k/7p/8/8/8/8/8/K7 b - - 0 1', 12)],
+    });
+  });
+  await move(page, 0, 'e7', 'e8');
+  const picker = page.getByRole('dialog', { name: 'Choose promotion piece' });
+  await expect(picker).toBeVisible();
+
+  await page.evaluate(() => { const g = (window as any).Game; g.cpuSetDelay(100); g.setMode('vs-cpu'); });
+  await expect.poll(async () => (await boards(page)).find((b) => b.timelineId === 1)!.moveCount, { timeout: 20_000 }).toBe(1);
+  await expect(picker).toBeVisible();
+  await picker.locator('button[data-piece="q"]').click();
+  expect((await boards(page)).find((b) => b.timelineId === 0)!.currentFen.split(' ')[0]).toBe('4Q2k/8/8/8/8/8/8/K7');
+  expect(errors).toEqual([]);
+});
+
+test('vs CPU: the command input cannot move the CPU side', async ({ page }) => {
+  await openGame(page);
+  const run = (cmd: string) => page.evaluate((c) => (window as any).Game._executeCommand(c), cmd);
+  // Two players: commands move either side
+  expect((await run('e2e4')).success).toBe(true);
+  // vs CPU (slow, so the CPU hasn't answered yet): Black belongs to the CPU
+  await page.evaluate(() => { const g = (window as any).Game; g.cpuSetDelay(2000); g.setMode('vs-cpu'); });
+  const result = await run('e7e5');
+  expect(result.success).toBe(false);
+  expect(result.message).toContain('CPU');
+  expect((await boards(page))[0].moveCount).toBe(1);
+});
+
+for (const mode of ['vs CPU', 'Watch']) {
+  test(`choosing ${mode} stops the demo`, async ({ page }) => {
+    const errors = collectErrors(page);
+    await openGame(page);
+    await page.locator('#example-play').click();
+    await expect.poll(async () => (await boards(page))[0].moveCount, { timeout: 10_000 }).toBeGreaterThanOrEqual(2);
+    await page.getByRole('radio', { name: mode }).click();
+    await expect(page.locator('#example-play')).toHaveText('▶ Demo');
+    expect(await page.evaluate(() => (window as any).Game._examplePlaying)).toBe(false);
+    await expect(page.getByRole('radio', { name: mode })).toHaveAttribute('aria-checked', 'true');
+    expect(errors).toEqual([]);
+  });
+}
