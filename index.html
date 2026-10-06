@@ -14,7 +14,7 @@
     </script>
     <title>6D Chess</title>
     <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>♟️</text></svg>">
-    <link rel="stylesheet" href="css/style.css?v=e78f143fc8">
+    <link rel="stylesheet" href="css/style.css?v=9a5c2bb81f">
 </head>
 <body>
     <div id="app">
@@ -23,8 +23,21 @@
                 <button id="2d-mode-toggle" class="sidebar-icon-btn" title="Toggle 2D top-down view (T)" aria-label="Toggle 2D view"><svg class="icon" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z"/><path d="m3.3 7 8.7 5 8.7-5"/><path d="M12 22V12"/></svg></button>
                 <button id="fit-view" class="sidebar-icon-btn" title="Show all boards (X)" aria-label="Show all boards"><svg class="icon" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M21 8V5a2 2 0 0 0-2-2h-3"/><path d="M3 16v3a2 2 0 0 0 2 2h3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/></svg></button>
                 <button id="cpu-camera-toggle" class="sidebar-icon-btn active" title="Camera follows CPU moves" aria-label="Camera follows CPU moves"><svg class="icon" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.997 4a2 2 0 0 1 1.76 1.05l.486.9A2 2 0 0 0 18.003 7H20a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2h1.997a2 2 0 0 0 1.759-1.048l.489-.904A2 2 0 0 1 10.004 4z"/><circle cx="12" cy="13" r="3"/></svg></button>
+                <button id="help-button" class="sidebar-icon-btn" title="How to play" aria-label="How to play"><svg class="icon" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><path d="M12 17h.01"/></svg></button>
             </div>
         </div>
+        <dialog id="help-dialog" aria-labelledby="help-title">
+            <h2 id="help-title">How to play 6D Chess</h2>
+            <p>Normal chess rules, across a growing multiverse of boards. Each board's past positions hang below it.</p>
+            <ul>
+                <li><b>Cross-timeline move</b> — select any piece except the king. Purple targets on other boards show where it can phase in: it appears on the same square of a board that is at the same move count with you to move, then lands on any empty square it could reach from there.</li>
+                <li><b>Time travel</b> — queens, rooks, bishops and knights can jump back to an earlier position of their board where it was your move (green portals on the history boards). This creates a new timeline.</li>
+                <li>You can never leave your king in check — on the board you leave or the board you arrive on.</li>
+                <li>The game ends when every timeline has finished; the side with more checkmates wins.</li>
+            </ul>
+            <p class="help-keys"><span class="key">Ctrl+Z</span> undo · <span class="key">T</span> 2D view · <span class="key">X</span> show all · <span class="key">WASD</span> pan · drag to orbit</p>
+            <form method="dialog"><button id="help-close" autofocus>Got it</button></form>
+        </dialog>
         <div id="sidebar">
             <div id="sidebar-resize"></div>
             <header id="sidebar-header">
@@ -38,9 +51,13 @@
             </div>
             <div id="button-row">
                 <button id="reset">New Game</button>
-                <button id="cpu-toggle">Start CPU</button>
                 <button id="example-play" title="Run scripted example game">▶ Demo</button>
                 <button id="undo" title="Undo last move (Ctrl+Z)" aria-label="Undo" disabled>↶</button>
+            </div>
+            <div id="mode-row" role="radiogroup" aria-label="Game mode">
+                <button data-mode="human" role="radio" title="Two players on this device">2 Players</button>
+                <button data-mode="vs-cpu" role="radio" title="You play White, the CPU plays Black">vs CPU</button>
+                <button data-mode="watch" role="radio" title="CPU plays both sides">Watch</button>
             </div>
             <div id="timeline-panel">
                 <div id="timeline-header">
@@ -152,6 +169,6 @@
     <script src="lib/OrbitControls.js"></script>
     <!-- Stockfish chess engine loads via Web Worker from lib/stockfish-worker.js -->
     <!-- TypeScript compiled bundle (with cache buster) -->
-    <script src="dist/bundle.js?v=126112c599"></script>
+    <script src="dist/bundle.js?v=54e28c47dc"></script>
 </body>
 </html>

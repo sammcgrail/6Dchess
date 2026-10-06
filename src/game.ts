@@ -39,6 +39,8 @@ import { stockfish } from './stockfish';
 import { sound } from './sound';
 
 const SAVE_KEY = '6dchess-save';
+
+type GameMode = 'human' | 'vs-cpu' | 'watch';
 // Mirrors TimelineCol.MAX_LAYERS (history boards shown under each board)
 const TIMELINE_MAX_LAYERS = 12;
 
@@ -135,6 +137,16 @@ class GameManager {
     this._refreshUi();
 
     document.getElementById('undo')?.addEventListener('click', () => this.undo());
+    // Don't lose a pending autosave when the tab is hidden or closed
+    window.addEventListener('pagehide', () => this._flushAutosave());
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) this._flushAutosave();
+    });
+    document.querySelectorAll<HTMLButtonElement>('#mode-row button').forEach((btn) =>
+      btn.addEventListener('click', () => this.setMode(btn.dataset.mode as GameMode))
+    );
+    const helpDialog = document.getElementById('help-dialog') as HTMLDialogElement | null;
+    document.getElementById('help-button')?.addEventListener('click', () => helpDialog?.showModal());
 
     // Setup collapsible shortcuts panel
     this._setupCollapsibleShortcuts();
@@ -1213,14 +1225,16 @@ timelines - list timelines`,
     const moveObj: { from: string; to: string; promotion?: PieceType } = { from: move.from, to: move.to };
     if (isPromotion) moveObj.promotion = promotionPiece || 'q';
 
-    const undoState = this.exportState();
+    const undoState = this.cpuMoveInProgress ? null : this.exportState();
     const result = chess.move(moveObj);
     if (!result) {
       console.error('Invalid move:', moveObj);
       return false;
     }
-    this.undoStack.push(undoState);
-    if (this.undoStack.length > 100) this.undoStack.shift();
+    if (undoState) {
+      this.undoStack.push(undoState);
+      if (this.undoStack.length > 100) this.undoStack.shift();
+    }
 
     // Use result.captured (actual move result) instead of move.captured (potential move)
     tl.moveHistory.push({
@@ -1610,6 +1624,8 @@ timelines - list timelines`,
 
   /** Remember the position before a move so it can be undone */
   private _pushUndo(): void {
+    // Only human moves are undo points, so undo also reverts the CPU's reply
+    if (this.cpuMoveInProgress) return;
     this.undoStack.push(this.exportState());
     if (this.undoStack.length > 100) this.undoStack.shift();
   }
@@ -1618,10 +1634,25 @@ timelines - list timelines`,
   undo(): boolean {
     const previous = this.undoStack.pop();
     if (!previous) return false;
-    return this.importState(previous);
+    const mode = this.getMode();
+    const ok = this.importState(previous);
+    // Keep playing against the CPU after taking a move back
+    if (ok && mode === 'vs-cpu') this.setMode('vs-cpu');
+    return ok;
   }
 
+  private _autosaveTimer: number | null = null;
+
+  /** Save soon; rapid CPU play coalesces into one write */
   private _autosave(): void {
+    if (this._autosaveTimer !== null) return;
+    this._autosaveTimer = window.setTimeout(() => this._flushAutosave(), 750);
+  }
+
+  private _flushAutosave(): void {
+    if (this._autosaveTimer === null) return;
+    clearTimeout(this._autosaveTimer);
+    this._autosaveTimer = null;
     try {
       localStorage.setItem(SAVE_KEY, JSON.stringify(this.exportState()));
     } catch {
@@ -1630,6 +1661,10 @@ timelines - list timelines`,
   }
 
   private _clearSave(): void {
+    if (this._autosaveTimer !== null) {
+      clearTimeout(this._autosaveTimer);
+      this._autosaveTimer = null;
+    }
     try {
       localStorage.removeItem(SAVE_KEY);
     } catch {
@@ -2384,6 +2419,30 @@ timelines - list timelines`,
   private cpuStockfishSkillBlack = 10;  // Skill level 0-20 for Black
   private cpuStockfishDepth = 10;  // Search depth 1-20
 
+  /** Current mode, derived from which sides the running CPU plays */
+  getMode(): GameMode | null {
+    if (!this.cpuEnabled) return 'human';
+    if (!this.cpuWhiteEnabled && this.cpuBlackEnabled) return 'vs-cpu';
+    if (this.cpuWhiteEnabled && this.cpuBlackEnabled) return 'watch';
+    return null;
+  }
+
+  /** Switch between two humans, human (White) vs CPU, and CPU vs CPU */
+  setMode(mode: GameMode): void {
+    if (mode === 'human') {
+      this.cpuStop();
+    } else {
+      this.cpuWhiteEnabled = mode === 'watch';
+      this.cpuBlackEnabled = true;
+      if (this.cpuEnabled) {
+        this._updateCpuUI();
+      } else {
+        this.cpuStart();
+      }
+    }
+    this._updateCpuUI();
+  }
+
   /** True when the CPU is running and plays this color, so humans may not move it */
   private _isCpuControlled(color: PieceColor): boolean {
     return this.cpuEnabled && (color === 'w' ? this.cpuWhiteEnabled : this.cpuBlackEnabled);
@@ -2780,6 +2839,13 @@ timelines - list timelines`,
 
   /** Update CPU UI elements */
   private _updateCpuUI(): void {
+    const mode = this.getMode();
+    document.querySelectorAll<HTMLButtonElement>('#mode-row button').forEach((b) => {
+      const on = b.dataset.mode === mode;
+      b.classList.toggle('active', on);
+      b.setAttribute('aria-checked', String(on));
+    });
+
     const btn = document.getElementById('cpu-toggle');
     if (btn) {
       btn.textContent = this.cpuEnabled ? 'Stop CPU' : 'Start CPU';

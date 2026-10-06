@@ -82,6 +82,7 @@ const BLACK = new THREE.Color(0x000000);
 const LIGHT_SQUARE = new THREE.Color(0x7878ac);
 const DARK_SQUARE = new THREE.Color(0x45456f);
 const SELECTED_SQUARE = new THREE.Color(0xd4b040);
+const HOVER_TINT = new THREE.Color(0xb8c4ff);
 const CHECKMATE_GLOW = new THREE.Color(0xff3333);
 const DRAW_GLOW = new THREE.Color(0xffa500);
 
@@ -680,6 +681,25 @@ export class TimelineCol implements ITimelineCol {
     this.squares.instanceColor!.needsUpdate = true;
   }
 
+  private hoveredSquare: number | null = null;
+
+  /** Color for a square given selection and hover state */
+  private _restoreSquare(index: number): void {
+    const base = this._squareColor(Math.floor(index / 8), index % 8);
+    if (index === this.selectedSquare) this._setSquareColor(index, SELECTED_SQUARE);
+    else if (index === this.hoveredSquare) this._setSquareColor(index, HOVER_TINT.clone().lerp(base, 0.55));
+    else this._setSquareColor(index, base);
+  }
+
+  /** Highlight the square under the pointer (null clears) */
+  setHover(index: number | null): void {
+    if (index === this.hoveredSquare) return;
+    const previous = this.hoveredSquare;
+    this.hoveredSquare = index;
+    if (previous !== null) this._restoreSquare(previous);
+    if (index !== null) this._restoreSquare(index);
+  }
+
   select(sq: string): void {
     this.clearHighlights();
     const pos = this._fromSq(sq);
@@ -844,8 +864,9 @@ export class TimelineCol implements ITimelineCol {
 
   clearHighlights(): void {
     if (this.selectedSquare !== null) {
-      this._setSquareColor(this.selectedSquare, this._squareColor(Math.floor(this.selectedSquare / 8), this.selectedSquare % 8));
+      const previous = this.selectedSquare;
       this.selectedSquare = null;
+      this._restoreSquare(previous);
     }
     for (const h of this.highlightMeshes) {
       meshPool.release(h.mesh as PooledMesh);
@@ -1399,6 +1420,10 @@ class Board3DManager implements IBoard3D {
   private _boundResize: (() => void) | null = null;
   private _boundKeyDown: ((e: KeyboardEvent) => void) | null = null;
   private _boundKeyUp: ((e: KeyboardEvent) => void) | null = null;
+  private _boundPointerMove: ((e: PointerEvent) => void) | null = null;
+  private _boundPointerLeave: (() => void) | null = null;
+  private _pendingHover: { x: number; y: number } | null = null;
+  private _hoverCol: TimelineCol | null = null;
   private _boundBlur: (() => void) | null = null;
   private _boundPageHide: ((e: PageTransitionEvent) => void) | null = null;
   private _boundVisibilityChange: (() => void) | null = null;
@@ -1555,6 +1580,16 @@ class Board3DManager implements IBoard3D {
     this._createParticles();
 
     // Store bound event handlers for cleanup in dispose()
+    this._boundPointerMove = (e: PointerEvent) => {
+      this._pendingHover = e.buttons === 0 ? { x: e.clientX, y: e.clientY } : null;
+      if (e.buttons !== 0) this._clearHover();
+    };
+    this._boundPointerLeave = () => {
+      this._pendingHover = null;
+      this._clearHover();
+    };
+    this.renderer.domElement.addEventListener('pointermove', this._boundPointerMove);
+    this.renderer.domElement.addEventListener('pointerleave', this._boundPointerLeave);
     this._boundPointerDown = (e: PointerEvent) => {
       this._downPos = { x: e.clientX, y: e.clientY };
     };
@@ -2271,17 +2306,16 @@ class Board3DManager implements IBoard3D {
   }
 
   /* click -> find which timeline + square (or history square) */
-  private _onClick(event: PointerEvent): void {
-    if (!this.renderer || !this.raycaster || !this.mouse || !this.camera) return;
-
+  /** Raycast to the square (current or history board) under a screen point */
+  private _pickSquare(clientX: number, clientY: number): { timelineId: number; square: string; turn: number; isHistory: boolean; index: number } | null {
+    if (!this.renderer || !this.raycaster || !this.mouse || !this.camera) return null;
     const rect = this.renderer.domElement.getBoundingClientRect();
-    this.mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
-    this.mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+    this.mouse.x = ((clientX - rect.left) / rect.width) * 2 - 1;
+    this.mouse.y = -((clientY - rect.top) / rect.height) * 2 + 1;
     this.raycaster.setFromCamera(this.mouse, this.camera);
     // Objects added since the last frame (e.g. a new history layer) have stale world matrices
     this.scene?.updateMatrixWorld();
 
-    // Collect all clickable squares across all timelines
     let allMeshes: Mesh[] = [];
     for (const key in this.timelineCols) {
       allMeshes = allMeshes.concat(this.timelineCols[key].getAllSquareMeshes());
@@ -2291,35 +2325,55 @@ class Board3DManager implements IBoard3D {
       return true;
     };
     const hit = this.raycaster.intersectObjects(allMeshes).find((h) => isShown(h.object));
-    if (hit && this.onSquareClick) {
-      const ud = hit.object.userData;
-      if (ud.isBoardSquares && hit.instanceId !== undefined) {
-        this.onSquareClick({
-          timelineId: ud.timelineId as number,
-          square: String.fromCharCode(97 + (hit.instanceId % 8)) + (8 - Math.floor(hit.instanceId / 8)),
-          turn: -1,
-          isHistory: false,
-        });
-        return;
-      }
-      if (ud.isHistoryPlane && hit.uv) {
-        const c = Math.min(7, Math.floor(hit.uv.x * 8));
-        const r = Math.min(7, Math.floor((1 - hit.uv.y) * 8));
-        this.onSquareClick({
-          timelineId: ud.timelineId as number,
-          square: String.fromCharCode(97 + c) + (8 - r),
-          turn: ud.turn as number,
-          isHistory: true,
-        });
-        return;
-      }
-      this.onSquareClick({
-        timelineId: ud.timelineId as number,
-        square: ud.square as string,
-        turn: ud.turn as number,
-        isHistory: !!ud.isHistory,
-      });
+    if (!hit) return null;
+    const ud = hit.object.userData;
+    let c: number;
+    let r: number;
+    if (ud.isBoardSquares && hit.instanceId !== undefined) {
+      c = hit.instanceId % 8;
+      r = Math.floor(hit.instanceId / 8);
+    } else if (ud.isHistoryPlane && hit.uv) {
+      c = Math.min(7, Math.floor(hit.uv.x * 8));
+      r = Math.min(7, Math.floor((1 - hit.uv.y) * 8));
+    } else {
+      return null;
     }
+    return {
+      timelineId: ud.timelineId as number,
+      square: String.fromCharCode(97 + c) + (8 - r),
+      turn: ud.isHistoryPlane ? (ud.turn as number) : -1,
+      isHistory: !!ud.isHistoryPlane,
+      index: r * 8 + c,
+    };
+  }
+
+  /* click -> find which timeline + square (or history square) */
+  private _onClick(event: PointerEvent): void {
+    const pick = this._pickSquare(event.clientX, event.clientY);
+    if (pick && this.onSquareClick) {
+      this.onSquareClick({ timelineId: pick.timelineId, square: pick.square, turn: pick.turn, isHistory: pick.isHistory });
+    }
+  }
+
+  private _clearHover(): void {
+    this._hoverCol?.setHover(null);
+    this._hoverCol = null;
+    if (this.renderer) this.renderer.domElement.style.cursor = '';
+    this._needsRender = true;
+  }
+
+  /** Apply the latest pointer position to the hover highlight (at most once per frame) */
+  private _updateHover(): void {
+    const pending = this._pendingHover;
+    if (!pending) return;
+    this._pendingHover = null;
+    const pick = this._pickSquare(pending.x, pending.y);
+    const col = pick && !pick.isHistory ? this.timelineCols[pick.timelineId] : null;
+    if (this._hoverCol && this._hoverCol !== col) this._hoverCol.setHover(null);
+    this._hoverCol = col ?? null;
+    col?.setHover(pick!.index);
+    if (this.renderer) this.renderer.domElement.style.cursor = pick ? 'pointer' : '';
+    this._needsRender = true;
   }
 
   /** Schedule a debounced resize to prevent rapid re-renders */
@@ -2390,6 +2444,8 @@ class Board3DManager implements IBoard3D {
       this._lastFpsUpdate = t;
       this._updateFpsDisplay();
     }
+
+    this._updateHover();
 
     // Update WASD panning (marks dirty if moving)
     const wasPanning = this._updatePanning();
@@ -2845,25 +2901,7 @@ class Board3DManager implements IBoard3D {
       this.controls.target.copy(this._preZoomCameraState.target);
       this._preZoomCameraState = null;
     } else {
-      // Default: zoom out to see all boards
-      const timelineIds = Object.keys(this.timelineCols).map(k => parseInt(k));
-      if (timelineIds.length === 0) return;
-
-      // Calculate center and extent of all boards
-      let minX = Infinity, maxX = -Infinity;
-      for (const id of timelineIds) {
-        const x = this.timelineCols[id]?.xOffset ?? 0;
-        if (x < minX) minX = x;
-        if (x > maxX) maxX = x;
-      }
-
-      const centerX = (minX + maxX) / 2;
-      const extent = maxX - minX;
-      // Position camera to see all boards with some padding
-      const distance = Math.max(30, extent * 0.8 + 15);
-
-      this.controls.target.set(centerX, 0, 0);
-      this.camera.position.set(centerX, distance * 0.8, distance * 0.6);
+      this.zoomOutShowAll();
     }
 
     this._zoomedIn = false;
