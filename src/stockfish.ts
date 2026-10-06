@@ -30,7 +30,7 @@ export class StockfishManager {
   private staleBestmoves = 0;
 
   /** Hard cap on engine thinking time per move */
-  static readonly MOVE_TIME_MS = 4000;
+  static readonly MOVE_TIME_MS = 1500;
 
   constructor() {
     this.loadEngine();

@@ -1841,3 +1841,22 @@ summary:focus-visible {
     opacity: 0.35;
     cursor: default;
 }
+
+#button-row button {
+    white-space: nowrap;
+    min-width: 0;
+}
+
+#button-row #undo {
+    flex: 0 0 2.4rem;
+    padding: 0;
+}
+
+#button-row {
+    gap: 0.4rem;
+}
+
+#button-row button {
+    font-size: 0.8rem;
+    padding: 0.55rem 0.25rem;
+}

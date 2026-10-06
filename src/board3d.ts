@@ -1197,7 +1197,7 @@ export class TimelineCol implements ITimelineCol {
   private _setGroupOpacity(group: Group, opacity: number): void {
     const material = group.userData.material as Material | undefined;
     // The texture already carries square transparency; scale so the newest layer reads clearly
-    if (material) material.opacity = Math.min(1, opacity * 2.6);
+    if (material) material.opacity = Math.min(1, opacity * 1.9);
   }
 
   getAllSquareMeshes(): Mesh[] {
