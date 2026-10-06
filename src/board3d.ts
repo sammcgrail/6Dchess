@@ -2489,6 +2489,12 @@ class Board3DManager implements IBoard3D {
       this._needsRender = true;
       this._lastCameraPosition.copy(this.camera.position);
       this._lastCameraTarget.copy(this.controls.target);
+      // Thin the fog as the camera pulls back so wide overviews stay visible
+      const fog = this.scene.fog as InstanceType<typeof THREE.FogExp2> | null;
+      if (fog) {
+        const distance = this.camera.position.distanceTo(this.controls.target);
+        fog.density = Math.min(0.008, Math.max(0.0012, 0.32 / distance));
+      }
     }
 
     // Ambient motion (starfield drift, glow pulse) runs at a capped rate so an idle
@@ -3117,6 +3123,13 @@ class Board3DManager implements IBoard3D {
     const hFov = 2 * Math.atan(Math.tan(vFov / 2) * this.camera.aspect);
     const distance = Math.max(22, (halfWidth / Math.tan(hFov / 2)) * 1.05);
     const dir = new THREE.Vector3(0, 0.75, 0.66).normalize();
+
+    // Many timelines can need more room than the default orbit limit and far plane allow
+    this.controls.maxDistance = Math.max(this.controls.maxDistance, distance * 1.3);
+    if (this.camera.far < distance * 2) {
+      this.camera.far = distance * 2;
+      this.camera.updateProjectionMatrix();
+    }
 
     this._focusTween = undefined;  // an in-flight focus animation would drag the view back
     this.controls.target.set(centerX, -3, 0);
