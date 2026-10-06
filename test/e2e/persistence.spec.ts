@@ -57,6 +57,9 @@ test('undo is autosaved: reloading keeps the taken-back position', async ({ page
   await openGame(page);
   await move(page, 0, 'e2', 'e4');
   await move(page, 0, 'e7', 'e5');
+  // Let the debounced autosave of the last move land first; otherwise the pagehide flush on reload
+  // would save the undone position by accident and the test couldn't fail
+  await page.waitForTimeout(1200);
   await page.locator('#undo').click();
   expect((await boards(page))[0].moveCount).toBe(1);
 
