@@ -30,10 +30,35 @@ import {
   canCrossTimelines,
   canTimeTravel,
   crossTimelineLandingSquares,
+  pieceMap,
   planCrossTimelineMove,
   planTimeTravel,
+  scoreMultiverseMove,
 } from './rules';
 import { stockfish } from './stockfish';
+import { sound } from './sound';
+
+const SAVE_KEY = '6dchess-save';
+// Mirrors TimelineCol.MAX_LAYERS (history boards shown under each board)
+const TIMELINE_MAX_LAYERS = 12;
+
+interface SavedGame {
+  version: 1;
+  activeTimelineId: number;
+  nextTimelineId: number;
+  cpuGlobalTurn: PieceColor;
+  lines: unknown[];
+  timelines: Array<{
+    id: number;
+    name: string;
+    parentId: number | null;
+    branchTurn: number;
+    xOffset: number;
+    fen: string;
+    moveHistory: Move[];
+    snapshots: string[];
+  }>;
+}
 
 class GameManager {
   private timelines: Record<number, TimelineData> = {};
@@ -50,12 +75,32 @@ class GameManager {
   // Time travel movement state (queen moving backward in time)
   private timeTravelSelection: TimeTravelSelection | null = null;
 
+  // Previous game states for undo (most recent last)
+  private undoStack: SavedGame[] = [];
+
   // Cached state for optimized re-renders (avoid unnecessary DOM updates)
   private _lastMoveListHtml = '';
   private _lastTimelineStructure = '';
 
 
+  private _setupSoundToggle(): void {
+    const btn = document.getElementById('sound-toggle');
+    if (!btn) return;
+    const sync = () => {
+      btn.classList.toggle('muted', sound.muted);
+      btn.title = sound.muted ? 'Sound off (click to unmute)' : 'Sound on (click to mute)';
+      btn.setAttribute('aria-pressed', String(!sound.muted));
+    };
+    btn.addEventListener('click', () => {
+      sound.setMuted(!sound.muted);
+      sync();
+      if (!sound.muted) sound.play('move');
+    });
+    sync();
+  }
+
   init(): void {
+    this._setupSoundToggle();
     Board3D.init('scene-container', (info) => this.handleClick(info));
 
     const resetBtn = document.getElementById('reset');
@@ -81,12 +126,15 @@ class GameManager {
     // Setup timeline panel resize and collapse
     this._setupTimelinePanel();
 
-    // Create the main timeline
-    this._createTimeline(0, 0, null, -1, null);
-    this.setActiveTimeline(0);
-    this.renderTimeline(0);
-    this.updateStatus();
-    this.updateTimelineList();
+    // Resume the autosaved game, or start fresh
+    if (!this._restoreSave()) {
+      this._createTimeline(0, 0, null, -1, null);
+      this.setActiveTimeline(0);
+      this.renderTimeline(0);
+    }
+    this._refreshUi();
+
+    document.getElementById('undo')?.addEventListener('click', () => this.undo());
 
     // Setup collapsible shortcuts panel
     this._setupCollapsibleShortcuts();
@@ -252,6 +300,12 @@ class GameManager {
         return;
       }
 
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
+        e.preventDefault();
+        this.undo();
+        return;
+      }
+
       switch (e.key) {
         case 'ArrowLeft':
           e.preventDefault();
@@ -404,6 +458,8 @@ class GameManager {
         }
       });
     }
+
+    document.getElementById('fit-view')?.addEventListener('click', () => Board3D.zoomOutShowAll());
 
     const cameraToggle = document.getElementById('cpu-camera-toggle');
     if (cameraToggle) {
@@ -1157,11 +1213,14 @@ timelines - list timelines`,
     const moveObj: { from: string; to: string; promotion?: PieceType } = { from: move.from, to: move.to };
     if (isPromotion) moveObj.promotion = promotionPiece || 'q';
 
+    const undoState = this.exportState();
     const result = chess.move(moveObj);
     if (!result) {
       console.error('Invalid move:', moveObj);
       return false;
     }
+    this.undoStack.push(undoState);
+    if (this.undoStack.length > 100) this.undoStack.shift();
 
     // Use result.captured (actual move result) instead of move.captured (potential move)
     tl.moveHistory.push({
@@ -1190,6 +1249,8 @@ timelines - list timelines`,
 
     this.clearSelection();
     this.renderTimeline(tlId);
+    col?.animatePieceMove(move.from, move.to);
+    sound.play(chess.in_check() ? 'check' : result.captured ? 'capture' : 'move');
     this._afterMove();
     return true;
   }
@@ -1271,6 +1332,7 @@ timelines - list timelines`,
       return false;
     }
 
+    this._pushUndo();
     const isWhite = piece.color === 'w';
     const sourceBoardBefore = this._cloneBoard(sourceTl.chess);
     const targetBoardBefore = this._cloneBoard(targetTl.chess);
@@ -1318,6 +1380,7 @@ timelines - list timelines`,
     this.clearSelection();
     this.renderTimeline(sourceTimelineId);
     this.renderTimeline(targetTimelineId);
+    sound.play('portal');
     this._afterMove();
     return true;
   }
@@ -1393,6 +1456,8 @@ timelines - list timelines`,
     const isWhite = piece.color === 'w';
     const pieceChar = piece.type.toUpperCase();
 
+    this._pushUndo();
+
     // 1. Piece departs the source timeline
     const sourceBoardBefore = this._cloneBoard(sourceTl.chess);
     sourceTl.chess.load(plan.sourceFen);
@@ -1436,13 +1501,7 @@ timelines - list timelines`,
     });
     this._validateSnapshotConsistency(newTl);
 
-    const newCol = Board3D.getTimeline(newId);
-    if (newCol) {
-      for (let h = newTl.moveHistory.length - 1; h >= 0; h--) {
-        const mv = newTl.moveHistory[h];
-        newCol.addSnapshot(this._getSnapshotBoard(newTl.snapshots[h]), mv.from, mv.to, mv.isWhite);
-      }
-    }
+    this._buildHistoryLayers(newTl);
 
     // 3. Connection line (vertical drop then horizontal)
     Board3D.addTimeTravelLine(sourceTimelineId, targetTurnIndex, newId, sourceSquare, isWhite);
@@ -1453,6 +1512,7 @@ timelines - list timelines`,
     this.setActiveTimeline(newId, shouldFocus);
     this.renderTimeline(sourceTimelineId);
     this.renderTimeline(newId);
+    sound.play('portal');
     this._afterMove();
 
     Board3D.spawnPortalEffect(newId, sourceSquare);
@@ -1462,12 +1522,147 @@ timelines - list timelines`,
     return true;
   }
 
-  /** Shared UI refresh after any committed move */
-  private _afterMove(): void {
+  /** Add a history layer for every past position (oldest first, so the newest ends on top) */
+  private _buildHistoryLayers(tl: TimelineData): void {
+    const col = Board3D.getTimeline(tl.id);
+    if (!col) return;
+    const start = Math.max(0, tl.moveHistory.length - TIMELINE_MAX_LAYERS);
+    for (let h = start; h < tl.moveHistory.length; h++) {
+      const mv = tl.moveHistory[h];
+      col.addSnapshot(this._getSnapshotBoard(tl.snapshots[h]), mv.from, mv.to, mv.isWhite);
+    }
+  }
+
+  /* -- Save / restore / undo -- */
+
+  /** Serializable snapshot of the whole multiverse (snapshots stored as FEN only) */
+  exportState(): SavedGame {
+    return {
+      version: 1,
+      activeTimelineId: this.activeTimelineId,
+      nextTimelineId: this.nextTimelineId,
+      cpuGlobalTurn: this.cpuGlobalTurn,
+      lines: Board3D.exportLines(),
+      timelines: Object.values(this.timelines).map((tl) => ({
+        id: tl.id,
+        name: tl.name,
+        parentId: tl.parentId,
+        branchTurn: tl.branchTurn,
+        xOffset: tl.xOffset,
+        fen: tl.chess.fen(),
+        moveHistory: tl.moveHistory.map((m) => ({ ...m })),
+        snapshots: tl.snapshots.map((snap) => this._getSnapshotFen(snap) ?? ''),
+      })),
+    };
+  }
+
+  /** Rebuild the game (data and 3D scene) from exportState() output. Returns false if invalid. */
+  importState(state: SavedGame): boolean {
+    if (!state || state.version !== 1 || !Array.isArray(state.timelines) || state.timelines.length === 0) return false;
+    const rebuilt: Record<number, TimelineData> = {};
+    for (const saved of state.timelines) {
+      const chess = new Chess();
+      if (!chess.load(saved.fen) || saved.snapshots.length !== saved.moveHistory.length + 1) return false;
+      const snapshots: Snapshot[] = [];
+      for (const fen of saved.snapshots) {
+        const snapChess = new Chess();
+        if (!snapChess.load(fen)) return false;
+        snapshots.push(this._cloneBoard(snapChess));
+      }
+      rebuilt[saved.id] = {
+        id: saved.id,
+        name: saved.name,
+        parentId: saved.parentId,
+        branchTurn: saved.branchTurn,
+        xOffset: saved.xOffset,
+        chess,
+        moveHistory: saved.moveHistory,
+        snapshots,
+      };
+    }
+
+    this.cpuStop();
+    this._stopExamplePlay();
+    this.clearSelection();
+    Board3D.clearAll();
+    this.timelines = rebuilt;
+    this.nextTimelineId = state.nextTimelineId;
+    this.cpuGlobalTurn = state.cpuGlobalTurn;
+    this.viewingMoveIndex = null;
+    this._lastMoveListHtml = '';
+    this._lastTimelineStructure = '';
+    document.getElementById('game-end-toast')?.remove();
+
+    for (const tl of Object.values(rebuilt).sort((a, b) => a.id - b.id)) {
+      Board3D.createTimeline(tl.id, tl.xOffset);
+      this._buildHistoryLayers(tl);
+      this.renderTimeline(tl.id);
+    }
+    Board3D.importLines(state.lines ?? []);
+    if (Board3D.is2DMode()) {
+      Board3D.set2DMode(false);
+      Board3D.set2DMode(true);
+    }
+    this.setActiveTimeline(rebuilt[state.activeTimelineId] ? state.activeTimelineId : 0, true);
+    this._refreshUi();
+    return true;
+  }
+
+  /** Remember the position before a move so it can be undone */
+  private _pushUndo(): void {
+    this.undoStack.push(this.exportState());
+    if (this.undoStack.length > 100) this.undoStack.shift();
+  }
+
+  /** Undo the last move (any kind). Stops the CPU so it doesn't immediately replay. */
+  undo(): boolean {
+    const previous = this.undoStack.pop();
+    if (!previous) return false;
+    return this.importState(previous);
+  }
+
+  private _autosave(): void {
+    try {
+      localStorage.setItem(SAVE_KEY, JSON.stringify(this.exportState()));
+    } catch {
+      // storage full or unavailable - autosave is best effort
+    }
+  }
+
+  private _clearSave(): void {
+    try {
+      localStorage.removeItem(SAVE_KEY);
+    } catch {
+      // ignore
+    }
+  }
+
+  /** Restore the autosaved game, if any. Returns true when a game was restored. */
+  private _restoreSave(): boolean {
+    try {
+      const raw = localStorage.getItem(SAVE_KEY);
+      if (!raw) return false;
+      const state = JSON.parse(raw) as SavedGame;
+      const hasMoves = state.timelines?.some((tl) => tl.moveHistory.length > 0);
+      return hasMoves ? this.importState(state) : false;
+    } catch {
+      return false;
+    }
+  }
+
+  private _refreshUi(): void {
     this.updateStatus();
     this.updateMoveList();
     this.updateTimelineList();
     this._updateMoveSlider();
+    const undoBtn = document.getElementById('undo') as HTMLButtonElement | null;
+    if (undoBtn) undoBtn.disabled = this.undoStack.length === 0;
+  }
+
+  /** Shared UI refresh after any committed move */
+  private _afterMove(): void {
+    this._refreshUi();
+    this._autosave();
     // The CPU loop reports game end itself; human games need it here
     if (!this.cpuEnabled && this.isGlobalGameOver()) {
       this._handleGameEnd();
@@ -1502,10 +1697,10 @@ timelines - list timelines`,
       });
     });
 
-    const sidebar = document.getElementById('sidebar');
-    if (sidebar) {
-      sidebar.appendChild(picker);
-    }
+    picker.setAttribute('role', 'dialog');
+    picker.setAttribute('aria-label', 'Choose promotion piece');
+    document.body.appendChild(picker);
+    (picker.querySelector('button') as HTMLButtonElement | null)?.focus();
   }
 
   /* -- Snapshot consistency validation -- */
@@ -1846,91 +2041,50 @@ timelines - list timelines`,
     const listEl = document.getElementById('timeline-list');
     if (!listEl) return;
     const colors = Board3D.TIMELINE_COLORS;
+    const timelines = Object.values(this.timelines).sort((a, b) => a.id - b.id);
 
-    // Fixed 6-slot grid: Main + 5 branches (minimum visible)
-    const MIN_SLOTS = 6;
-    const slotNames = ['Main', 'Branch 1', 'Branch 2', 'Branch 3', 'Branch 4', 'Branch 5'];
-
-    // Map existing timelines to slots (by ID, sorted)
-    const timelineIds = Object.keys(this.timelines).map(k => parseInt(k)).sort((a, b) => a - b);
-    const totalSlots = Math.max(MIN_SLOTS, timelineIds.length);
-
-    // Check if structure changed (new timelines added)
-    const structureKey = timelineIds.join(',') + '|' + totalSlots;
-    const structureChanged = structureKey !== this._lastTimelineStructure;
-
-    if (structureChanged) {
-      // Full rebuild needed
-      let html = '';
-      for (let slot = 0; slot < totalSlots; slot++) {
-        const tlId = timelineIds[slot];
-        const tl = tlId !== undefined ? this.timelines[tlId] : null;
-        const color = colors[slot % colors.length];
-        const hexColor = '#' + color.toString(16).padStart(6, '0');
-
-        if (tl) {
-          const isActive = tl.id === this.activeTimelineId;
-          const turnCount = tl.moveHistory.length;
-
-          html +=
-            '<div class="tl-item' +
-            (isActive ? ' active' : '') +
-            '" data-tl-id="' +
-            tl.id +
-            '">' +
-            '<span class="tl-dot" style="background:' +
-            hexColor +
-            '"></span>' +
-            '<span class="tl-label">' +
-            tl.name +
-            '</span>' +
-            '<span class="tl-turn">' +
-            turnCount +
-            '</span></div>';
-        } else {
-          const name = slot < slotNames.length ? slotNames[slot] : 'Branch ' + slot;
-          html +=
-            '<div class="tl-item empty">' +
-            '<span class="tl-dot" style="background:' +
-            hexColor +
-            '; opacity: 0.3"></span>' +
-            '<span class="tl-label">' +
-            name +
-            '</span>' +
-            '<span class="tl-turn">-</span></div>';
-        }
-      }
-
-      listEl.innerHTML = html;
+    // Rebuild only when the set of timelines changes; otherwise update in place (no scroll jump)
+    const structureKey = timelines.map((tl) => tl.id).join(',');
+    if (structureKey !== this._lastTimelineStructure) {
+      listEl.innerHTML = timelines
+        .map((tl) => {
+          const hex = '#' + colors[tl.id % colors.length].toString(16).padStart(6, '0');
+          return (
+            `<div class="tl-item" data-tl-id="${tl.id}" style="--tl-color:${hex}">` +
+            '<span class="tl-dot"></span>' +
+            `<span class="tl-label">${tl.name}</span>` +
+            '<span class="tl-state"></span>' +
+            '<span class="tl-turn"></span></div>'
+          );
+        })
+        .join('');
       this._lastTimelineStructure = structureKey;
-      // Click handlers are now managed via event delegation in _setupTimelinePanel()
-    } else {
-      // Just update active state and move counts in place (no scroll jump)
-      const items = listEl.querySelectorAll('.tl-item');
-      items.forEach((item) => {
-        const el = item as HTMLElement;
-        const tlId = el.dataset.tlId;
-        if (tlId === undefined) return; // empty slot
-
-        const id = parseInt(tlId);
-        const tl = this.timelines[id];
-        if (!tl) return;
-
-        // Update active class
-        if (id === this.activeTimelineId) {
-          el.classList.add('active');
-        } else {
-          el.classList.remove('active');
-        }
-
-        // Update move count
-        const turnEl = el.querySelector('.tl-turn');
-        if (turnEl) {
-          turnEl.textContent = String(tl.moveHistory.length);
-        }
-      });
     }
+
+    listEl.querySelectorAll<HTMLElement>('.tl-item').forEach((el) => {
+      const tl = this.timelines[Number(el.dataset.tlId)];
+      if (!tl) return;
+      el.classList.toggle('active', tl.id === this.activeTimelineId);
+      const chess = tl.chess;
+      const stateEl = el.querySelector('.tl-state') as HTMLElement;
+      let state = chess.turn() === 'w' ? 'to-move-w' : 'to-move-b';
+      let title = (chess.turn() === 'w' ? 'White' : 'Black') + ' to move';
+      if (chess.in_checkmate()) {
+        state = 'mate';
+        title = 'Checkmate — ' + (chess.turn() === 'w' ? 'Black' : 'White') + ' wins';
+      } else if (chess.in_draw() || chess.in_stalemate()) {
+        state = 'draw';
+        title = chess.in_stalemate() ? 'Stalemate' : 'Draw';
+      } else if (chess.in_check()) {
+        state += ' check';
+        title += ' (check)';
+      }
+      stateEl.className = 'tl-state ' + state;
+      el.title = `${tl.name}: ${title}`;
+      (el.querySelector('.tl-turn') as HTMLElement).textContent = String(tl.moveHistory.length);
+    });
   }
+
 
   /* -- Get branch points for a timeline -- */
   getBranchPoints(tlId: number): { childId: number; moveIndex: number; name: string }[] {
@@ -1997,6 +2151,7 @@ timelines - list timelines`,
    * Handle game end - zoom out to show all boards and display stats toast.
    */
   private _handleGameEnd(): void {
+    sound.play('end');
     // Zoom out camera to show all boards
     Board3D.zoomOutShowAll();
 
@@ -2066,19 +2221,19 @@ timelines - list timelines`,
     let winnerEmoji: string;
     if (stats.winner === 'white') {
       winnerText = 'White Wins!';
-      winnerEmoji = '⚪';
+      winnerEmoji = '♔';
     } else if (stats.winner === 'black') {
       winnerText = 'Black Wins!';
-      winnerEmoji = '⚫';
+      winnerEmoji = '♚';
     } else {
       winnerText = 'Draw!';
-      winnerEmoji = '🤝';
+      winnerEmoji = '½';
     }
 
     toast.innerHTML = `
       <div class="toast-header">
         <span class="toast-title">${winnerEmoji} ${winnerText}</span>
-        <button class="toast-close" onclick="this.parentElement.parentElement.remove()">×</button>
+        <button class="toast-close" aria-label="Close">×</button>
       </div>
       <div class="toast-body">
         <div class="toast-stat"><span>Timelines:</span> <strong>${stats.totalTimelines}</strong></div>
@@ -2089,6 +2244,7 @@ timelines - list timelines`,
       </div>
     `;
 
+    toast.querySelector('.toast-close')?.addEventListener('click', () => toast.remove());
     document.body.appendChild(toast);
 
     // Auto-fade after 10 seconds (but stays if user hovers)
@@ -2169,7 +2325,8 @@ timelines - list timelines`,
     this.cpuStop();
     this.cpuGlobalTurn = 'w';
     this.clearSelection();
-    this.recentCrossTimelineMoves = [];
+    this.undoStack = [];
+    this._clearSave();
 
     Board3D.clearAll();
     this.timelines = {};
@@ -2220,14 +2377,6 @@ timelines - list timelines`,
   private cpuCrossTimelineChance = 0.75;  // Base chance for cross-timeline moves (0-1)
   private cpuTimeTravelChance = 0.5;      // Base chance for time travel moves (0-1)
 
-  // Cross-timeline loop detection - prevent ping-pong moves
-  private recentCrossTimelineMoves: Array<{
-    sourceTimelineId: number;
-    targetTimelineId: number;
-    square: string;
-    pieceType: string;
-  }> = [];
-  private crossTimelineHistorySize = 6;  // Track last 6 cross-timeline moves
 
   // Stockfish settings
   private cpuUseStockfish = true;  // Use Stockfish when available
@@ -2531,248 +2680,76 @@ timelines - list timelines`,
     return pool[Math.floor(Math.random() * pool.length)];
   }
 
-  /** Check if CPU has a time travel opportunity on this timeline */
+  /**
+   * Pick among scored multiverse candidates. Strong candidates (mate, check, rescuing a piece)
+   * are played with the slider's probability; purposeless ones only rarely, for variety.
+   */
+  private _cpuPickMultiverseMove<T extends { score: number; bias: number }>(candidates: T[], chance: number): T | null {
+    if (candidates.length === 0) return null;
+    candidates.sort((a, b) => b.score - a.score || b.bias - a.bias);
+    const best = candidates[0];
+    if (best.score >= 1000) return best; // forced win on another board: always take it
+    const strength = Math.min(1, Math.max(0, best.score) / 4);
+    const probability = chance * (0.08 + 0.92 * strength) * (0.5 + best.bias);
+    if (Math.random() >= probability) return null;
+    // Choose randomly among equally good candidates to avoid repetitive play
+    const top = candidates.filter((c) => c.score === best.score);
+    return top[Math.floor(Math.random() * top.length)];
+  }
+
+  /** Check if CPU has a worthwhile time travel move on this timeline */
   private _cpuCheckTimeTravel(tlId: number): TimeTravelTarget & { sourceSquare: Square; piece: Piece } | null {
     const tl = this.timelines[tlId];
     if (!tl) return null;
-
     const color = tl.chess.turn();
-    const board = tl.chess.board();
-    const isWhite = color === 'w';
-    const portalBiases = isWhite ? this.cpuWhitePortalBias : this.cpuBlackPortalBias;
+    const biases = color === 'w' ? this.cpuWhitePortalBias : this.cpuBlackPortalBias;
+    const sourceFen = tl.chess.fen();
+    const candidates: Array<{ target: TimeTravelTarget; sourceSquare: Square; piece: Piece; score: number; bias: number }> = [];
 
-    // Collect all portal opportunities with their biases
-    const opportunities: Array<{
-      target: TimeTravelTarget;
-      sourceSquare: Square;
-      piece: Piece;
-      bias: number;
-    }> = [];
-
-    // Find pieces that can time travel (q, r, b, n)
-    const timeTravelPieces = ['q', 'r', 'b', 'n'];
-    for (let r = 0; r < 8; r++) {
-      for (let c = 0; c < 8; c++) {
-        const piece = board[r][c];
-        if (piece && timeTravelPieces.includes(piece.type) && piece.color === color) {
-          const bias = portalBiases[piece.type] || 0;
-          if (bias <= 0) continue; // Skip if bias is 0
-
-          const square = (String.fromCharCode(97 + c) + (8 - r)) as Square;
-          const targets = this._getTimeTravelTargets(tlId, square, piece);
-
-          for (const target of targets) {
-            opportunities.push({ target, sourceSquare: square, piece, bias });
-          }
-        }
+    for (const [square, piece] of pieceMap(sourceFen)) {
+      if (piece.color !== color || !canTimeTravel(piece.type)) continue;
+      const bias = biases[piece.type] ?? 0;
+      if (bias <= 0) continue;
+      for (const target of this._getTimeTravelTargets(tlId, square, piece)) {
+        const snapshotFen = this._getSnapshotFen(tl.snapshots[tl.snapshots.length - 2 - target.targetTurnIndex]);
+        const plan = snapshotFen ? planTimeTravel(sourceFen, snapshotFen, square, piece) : null;
+        if (!plan || !plan.ok) continue;
+        const score = scoreMultiverseMove(sourceFen, square, plan.arrivalFen, square, piece, plan.captured);
+        candidates.push({ target, sourceSquare: square, piece, score, bias });
       }
     }
 
-    if (opportunities.length === 0 || Math.random() >= this.cpuTimeTravelChance) return null;
-
-    // For each opportunity, roll dice based on its bias
-    // Prefer captures, use highest-bias piece type
-    const captures = opportunities.filter(o => o.target.isCapture);
-    const pool = captures.length > 0 ? captures : opportunities;
-
-    // Sort by bias (highest first) and pick from top opportunities
-    pool.sort((a, b) => b.bias - a.bias);
-
-    // Pick the first opportunity that passes its bias check
-    for (const opp of pool) {
-      if (Math.random() < opp.bias) {
-        return { ...opp.target, sourceSquare: opp.sourceSquare, piece: opp.piece };
-      }
-    }
-
-    return null;
+    const pick = this._cpuPickMultiverseMove(candidates, this.cpuTimeTravelChance);
+    return pick ? { ...pick.target, sourceSquare: pick.sourceSquare, piece: pick.piece } : null;
   }
 
-  /**
-   * 5D-Aware CPU: Check for cross-timeline opportunities with strategic evaluation.
-   * Considers board evaluations across ALL timelines to decide when to cross.
-   */
-  private _cpuCheckCrossTimeline(tlId: number): { targetTimelineId: number; sourceSquare: Square; targetSquare: Square; piece: Piece; isCapture: boolean } | null {
+  /** Check if CPU has a worthwhile cross-timeline move from this timeline */
+  private _cpuCheckCrossTimeline(tlId: number): { targetTimelineId: number; sourceSquare: Square; targetSquare: Square; piece: Piece } | null {
     const tl = this.timelines[tlId];
-    if (!tl) return null;
-
-    const timelineIds = Object.keys(this.timelines).map(Number);
-    // Need at least 2 timelines to cross
-    if (timelineIds.length < 2) return null;
-
+    if (!tl || Object.keys(this.timelines).length < 2) return null;
     const color = tl.chess.turn();
-    const board = tl.chess.board();
-    const isWhite = color === 'w';
-    const portalBiases = isWhite ? this.cpuWhitePortalBias : this.cpuBlackPortalBias;
+    const biases = color === 'w' ? this.cpuWhitePortalBias : this.cpuBlackPortalBias;
+    const sourceFen = tl.chess.fen();
+    const sourceEval = this._evaluateMaterialBalance(tl.chess, color);
+    const candidates: Array<{ targetTimelineId: number; sourceSquare: Square; targetSquare: Square; piece: Piece; score: number; bias: number }> = [];
 
-    // 5D AWARENESS: Evaluate material balance on all timelines
-    const timelineEvals: Record<number, number> = {};
-    for (const id of timelineIds) {
-      const timeline = this.timelines[id];
-      if (timeline) {
-        timelineEvals[id] = this._evaluateMaterialBalance(timeline.chess, color);
+    for (const [square, piece] of pieceMap(sourceFen)) {
+      if (piece.color !== color || !canCrossTimelines(piece.type)) continue;
+      const bias = biases[piece.type] ?? 0.1;
+      if (bias <= 0) continue;
+      for (const target of this.getCrossTimelineTargets(tlId, square, piece)) {
+        const targetTl = this.timelines[target.targetTimelineId];
+        const plan = planCrossTimelineMove(sourceFen, targetTl.chess.fen(), square, target.targetSquare, piece);
+        if (!plan.ok) continue;
+        let score = scoreMultiverseMove(sourceFen, square, plan.targetFen, target.targetSquare, piece);
+        // Reinforce a board where we're behind using material from one where we're ahead
+        const targetEval = this._evaluateMaterialBalance(targetTl.chess, color);
+        if (sourceEval - targetEval >= 3 && score >= 0) score += 2;
+        candidates.push({ targetTimelineId: target.targetTimelineId, sourceSquare: square, targetSquare: target.targetSquare, piece, score, bias });
       }
     }
 
-    // Current board evaluation (positive = winning, negative = losing)
-    const sourceEval = timelineEvals[tlId] || 0;
-
-    // Collect all cross-timeline opportunities with strategic scoring
-    const opportunities: Array<{
-      targetTimelineId: number;
-      sourceSquare: Square;
-      targetSquare: Square;
-      piece: Piece;
-      isCapture: boolean;
-      bias: number;
-      strategicScore: number;
-    }> = [];
-
-    // Find pieces that can cross timelines (all except king)
-    for (let r = 0; r < 8; r++) {
-      for (let c = 0; c < 8; c++) {
-        const piece = board[r][c];
-        if (piece && piece.type !== 'k' && piece.color === color) {
-          const baseBias = portalBiases[piece.type] || 0.1;
-          if (baseBias <= 0) continue;
-
-          const sourceSquare = (String.fromCharCode(97 + c) + (8 - r)) as Square;
-          const targets = this.getCrossTimelineTargets(tlId, sourceSquare, piece);
-
-          for (const target of targets) {
-            const targetEval = timelineEvals[target.targetTimelineId] || 0;
-
-            // Strategic scoring based on 5D chess awareness:
-            // 1. If source board is LOSING and target is WINNING: HIGH priority (send reinforcements)
-            // 2. If source board is WINNING and target is LOSING: MEDIUM priority (press advantage)
-            // 3. Captures are always valuable
-            // 4. Sending to boards where we're already winning = build overwhelming force
-
-            let strategicScore = 0;
-
-            // Capture bonus (very valuable in multi-board chess)
-            if (target.isCapture) {
-              strategicScore += 3;
-            }
-
-            // Piece value for the crossing piece
-            const pieceValues: Record<string, number> = { p: 1, n: 3, b: 3, r: 5, q: 9 };
-            const pieceValue = pieceValues[piece.type] || 1;
-
-            // 5D tactical evaluation
-            if (sourceEval > 3 && targetEval < -1) {
-              // We're winning here, losing there - send reinforcements!
-              strategicScore += 4;
-            } else if (sourceEval < -1 && targetEval > 1) {
-              // We're losing here but winning there - escape valuable pieces
-              strategicScore += 2 + (pieceValue > 3 ? 2 : 0);
-            } else if (targetEval > 2) {
-              // Target board is favorable - build overwhelming force
-              strategicScore += 2;
-            }
-
-            // Bonus for high-value pieces crossing (queens, rooks)
-            if (pieceValue >= 5) {
-              strategicScore += 1;
-            }
-
-            opportunities.push({
-              targetTimelineId: target.targetTimelineId,
-              sourceSquare,
-              targetSquare: target.targetSquare,
-              piece,
-              isCapture: target.isCapture,
-              bias: baseBias,
-              strategicScore,
-            });
-          }
-        }
-      }
-    }
-
-    if (opportunities.length === 0) return null;
-
-    // Sort by strategic score (highest first), then by capture, then by bias
-    opportunities.sort((a, b) => {
-      if (b.strategicScore !== a.strategicScore) return b.strategicScore - a.strategicScore;
-      if (a.isCapture !== b.isCapture) return a.isCapture ? -1 : 1;
-      return b.bias - a.bias;
-    });
-
-    // 5D Aggressive mode: use slider-controlled cross-timeline chance
-    for (const opp of opportunities) {
-      // LOOP DETECTION: Check if this would be a ping-pong move
-      if (this._wouldBePingPongMove(tlId, opp.targetTimelineId, opp.targetSquare, opp.piece.type)) {
-        continue; // Skip this opportunity, try next
-      }
-
-      // Base chance from slider, plus strategic bonus
-      const baseChance = this.cpuCrossTimelineChance;
-      const strategicBonus = opp.strategicScore * 0.10; // Each strategic point adds 10%
-      const totalChance = Math.min(0.95, baseChance + strategicBonus);
-
-      if (Math.random() < totalChance) {
-
-        // Record this move in history for loop detection
-        this._recordCrossTimelineMove(tlId, opp.targetTimelineId, opp.targetSquare, opp.piece.type);
-
-        return {
-          targetTimelineId: opp.targetTimelineId,
-          sourceSquare: opp.sourceSquare,
-          targetSquare: opp.targetSquare,
-          piece: opp.piece,
-          isCapture: opp.isCapture,
-        };
-      }
-    }
-
-    return null;
-  }
-
-  /** Check if a cross-timeline move would create a ping-pong pattern */
-  private _wouldBePingPongMove(sourceId: number, targetId: number, square: string, pieceType: string): boolean {
-    // Look at recent moves involving this piece type from same square
-    const relevantMoves = this.recentCrossTimelineMoves.filter(
-      m => m.square === square && m.pieceType === pieceType
-    );
-
-    if (relevantMoves.length < 1) return false;
-
-    // Check if the last move was the reverse (target→source)
-    const lastMove = relevantMoves[relevantMoves.length - 1];
-    if (lastMove.sourceTimelineId === targetId && lastMove.targetTimelineId === sourceId) {
-      return true; // Would immediately reverse the last move
-    }
-
-    // Check for A→B→A pattern in last 2 moves
-    if (relevantMoves.length >= 2) {
-      const secondLast = relevantMoves[relevantMoves.length - 2];
-      if (
-        secondLast.sourceTimelineId === sourceId &&
-        secondLast.targetTimelineId === targetId &&
-        lastMove.sourceTimelineId === targetId &&
-        lastMove.targetTimelineId === sourceId
-      ) {
-        return true; // Would create A→B→A→B pattern
-      }
-    }
-
-    return false;
-  }
-
-  /** Record a cross-timeline move for loop detection */
-  private _recordCrossTimelineMove(sourceId: number, targetId: number, square: string, pieceType: string): void {
-    this.recentCrossTimelineMoves.push({
-      sourceTimelineId: sourceId,
-      targetTimelineId: targetId,
-      square,
-      pieceType,
-    });
-
-    // Keep history limited
-    while (this.recentCrossTimelineMoves.length > this.crossTimelineHistorySize) {
-      this.recentCrossTimelineMoves.shift();
-    }
+    return this._cpuPickMultiverseMove(candidates, this.cpuCrossTimelineChance);
   }
 
   /** Evaluate material balance for a position (positive = color is winning) */

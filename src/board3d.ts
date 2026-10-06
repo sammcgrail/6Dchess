@@ -4,7 +4,7 @@
 import type {
   Scene, PerspectiveCamera, WebGLRenderer, Raycaster, Vector2, Vector3, Clock,
   Group, Mesh, Sprite, Points, Material, MeshStandardMaterial, SpriteMaterial,
-  Texture, Object3D, Curve, BufferGeometry
+  Texture, Object3D, Curve, BufferGeometry, Color as THREE_Color
 } from 'three';
 
 import type {
@@ -51,7 +51,37 @@ const pieceMaterialCache = new Map<Texture, SpriteMaterial>();
 // Board coordinate labels are identical on every board, so share them
 const labelMaterialCache = new Map<string, SpriteMaterial>();
 
+// Piece slide animations, advanced by Board3DManager's render loop
+interface PieceTween {
+  sprite: Sprite;
+  fromX: number;
+  fromZ: number;
+  toX: number;
+  toZ: number;
+  start: number;
+}
+const PIECE_SLIDE_MS = 220;
+const pieceTweens: PieceTween[] = [];
+
+/** Advance piece slides; returns true while any are running */
+function updatePieceTweens(now: number): boolean {
+  for (let i = pieceTweens.length - 1; i >= 0; i--) {
+    const t = pieceTweens[i];
+    const k = Math.min(1, (now - t.start) / PIECE_SLIDE_MS);
+    const e = 1 - Math.pow(1 - k, 3); // ease-out cubic
+    t.sprite.position.x = t.fromX + (t.toX - t.fromX) * e;
+    t.sprite.position.z = t.fromZ + (t.toZ - t.fromZ) * e;
+    // Small hop so the piece reads as moving over the board
+    t.sprite.position.y = TimelineCol.MAIN_PIECE_Y + Math.sin(Math.PI * e) * 0.25;
+    if (k >= 1) pieceTweens.splice(i, 1);
+  }
+  return pieceTweens.length > 0;
+}
+
 const BLACK = new THREE.Color(0x000000);
+const LIGHT_SQUARE = new THREE.Color(0x7878ac);
+const DARK_SQUARE = new THREE.Color(0x45456f);
+const SELECTED_SQUARE = new THREE.Color(0xd4b040);
 const CHECKMATE_GLOW = new THREE.Color(0xff3333);
 const DRAW_GLOW = new THREE.Color(0xffa500);
 
@@ -96,10 +126,10 @@ class SharedResources {
 
   // Shared geometries (created once, reused everywhere)
   squareGeometry: InstanceType<typeof THREE.PlaneGeometry> | null = null;
-  historySquareGeometry: InstanceType<typeof THREE.BoxGeometry> | null = null;
   boardBaseGeometry: InstanceType<typeof THREE.BoxGeometry> | null = null;
   boardTrimGeometry: InstanceType<typeof THREE.BoxGeometry> | null = null;
   historyBaseGeometry: InstanceType<typeof THREE.BoxGeometry> | null = null;
+  historyPlaneGeometry: InstanceType<typeof THREE.PlaneGeometry> | null = null;
 
   // Move indicator geometries
   moveIndicatorCircle: InstanceType<typeof THREE.CircleGeometry> | null = null;
@@ -131,8 +161,6 @@ class SharedResources {
 
   // Shared history square materials - use clones for per-layer opacity
   // PERFORMANCE: 2 base materials instead of 64+ per layer (768+ for 12 layers)
-  historySquareLightMat: MeshStandardMaterial | null = null;
-  historySquareDarkMat: MeshStandardMaterial | null = null;
 
   static getInstance(): SharedResources {
     if (!SharedResources._instance) {
@@ -145,10 +173,10 @@ class SharedResources {
   private _init(): void {
     // === Geometries ===
     this.squareGeometry = new THREE.PlaneGeometry(0.96, 0.96);
-    this.historySquareGeometry = new THREE.BoxGeometry(0.93, 0.025, 0.93);
     this.boardBaseGeometry = new THREE.BoxGeometry(8.6, 0.18, 8.6);
     this.boardTrimGeometry = new THREE.BoxGeometry(8.8, 0.06, 8.8);
     this.historyBaseGeometry = new THREE.BoxGeometry(8.2, 0.03, 8.2);
+    this.historyPlaneGeometry = new THREE.PlaneGeometry(8, 8);
 
     // Move indicators
     this.moveIndicatorCircle = new THREE.CircleGeometry(0.14, 32);
@@ -186,20 +214,6 @@ class SharedResources {
 
     // History square materials - shared base materials for cloning
     // Using clone() allows per-layer opacity while sharing the base material properties
-    this.historySquareLightMat = new THREE.MeshStandardMaterial({
-      color: 0x5a5a88,  // Darker colors for history squares
-      transparent: true,
-      opacity: 0.15,
-      metalness: 0.15,
-      roughness: 0.8,
-    });
-    this.historySquareDarkMat = new THREE.MeshStandardMaterial({
-      color: 0x38385a,
-      transparent: true,
-      opacity: 0.15,
-      metalness: 0.15,
-      roughness: 0.8,
-    });
 
     this.moveIndicatorMat = new THREE.MeshBasicMaterial({
       color: 0xffdd44,
@@ -260,10 +274,10 @@ class SharedResources {
   /** Dispose all shared resources (call on game shutdown) */
   dispose(): void {
     this.squareGeometry?.dispose();
-    this.historySquareGeometry?.dispose();
     this.boardBaseGeometry?.dispose();
     this.boardTrimGeometry?.dispose();
     this.historyBaseGeometry?.dispose();
+    this.historyPlaneGeometry?.dispose();
     this.moveIndicatorCircle?.dispose();
     this.moveIndicatorRing?.dispose();
     this.lastMoveHighlightGeometry?.dispose();
@@ -277,8 +291,6 @@ class SharedResources {
     this.boardBaseMat?.dispose();
     this.boardTrimMat?.dispose();
     this.historyBaseMat?.dispose();
-    this.historySquareLightMat?.dispose();
-    this.historySquareDarkMat?.dispose();
     this.moveIndicatorMat?.dispose();
     this.lastMoveHighlightMat?.dispose();
     this.crossTimelineRingMat?.dispose();
@@ -378,6 +390,8 @@ class SpritePool {
   }
 
   release(sprite: PooledSprite): void {
+    // A released sprite may be reused elsewhere; stop any slide still driving it
+    for (let i = pieceTweens.length - 1; i >= 0; i--) if (pieceTweens[i].sprite === sprite) pieceTweens.splice(i, 1);
     sprite.parent?.remove(sprite);
     sprite.visible = false;
     if (this.pool.length < this.maxPoolSize) this.pool.push(sprite);
@@ -404,6 +418,7 @@ export class TimelineCol implements ITimelineCol {
   static readonly HISTORY_PIECE_Y = 0.12;
   static readonly PIECE_SCALE_3D = 0.88;
   static readonly PIECE_SCALE_2D = 1.25;
+  static readonly HISTORY_TEXTURE_SIZE = 256;
   // Board bounds for piece position validation (8x8 board centered at origin).
   // Pieces are placed at positions col-3.5 (from -3.5 to 3.5), but we use
   // slightly wider bounds (-4 to 4) to account for floating-point tolerance.
@@ -419,11 +434,12 @@ export class TimelineCol implements ITimelineCol {
   private _pieceTex: (char: string, isWhite: boolean) => Texture;
 
   group: Group;
-  private squareMeshes: Mesh[] = [];
+  private squares!: InstanceType<typeof THREE.InstancedMesh>;
+  private squareMat = new THREE.MeshStandardMaterial({ color: 0xffffff, metalness: 0.15, roughness: 0.75 });
+  private selectedSquare: number | null = null;
   private highlightMeshes: HighlightEntry[] = [];
   private lastMoveHL: Mesh[] = [];
   historyLayers: Group[] = [];  // Public for branch line rebuilding
-  private historySquareMeshes: Mesh[] = [];
   private moveLineGroup: Group;
   interLayerGroup: Group;
   private crossTimelineTargets: Mesh[] = [];  // Purple highlights for cross-timeline moves
@@ -433,6 +449,8 @@ export class TimelineCol implements ITimelineCol {
   // Per-board clones of the base/trim materials so active/highlight glow affects only this board
   private baseMat: MeshStandardMaterial;
   private trimMat: MeshStandardMaterial;
+  private tint: THREE_Color;
+  private nameLabel: Sprite | null = null;
 
   // Performance: track previous board state for diff-based rendering
   // Store as map of "row,col" -> "type,color" to detect what changed
@@ -444,6 +462,7 @@ export class TimelineCol implements ITimelineCol {
     scene: Scene,
     id: number,
     xOffset: number,
+    tintColor: number,
     pieceChars: PieceCharMap,
     pieceTex: (char: string, isWhite: boolean) => Texture
   ) {
@@ -458,6 +477,9 @@ export class TimelineCol implements ITimelineCol {
     this.group.position.x = xOffset;
     this.baseMat = this.shared.boardBaseMat!.clone();
     this.trimMat = this.shared.boardTrimMat!.clone();
+    // Tint the frame with the timeline's color so boards match the sidebar list
+    this.tint = new THREE.Color(tintColor);
+    this.trimMat.color.lerp(this.tint, 0.55);
 
     this.moveLineGroup = new THREE.Group();
     this.interLayerGroup = new THREE.Group();
@@ -465,13 +487,11 @@ export class TimelineCol implements ITimelineCol {
     this.group.add(this.interLayerGroup);
 
     this._buildBoard();
+    this._addNameLabel(id === 0 ? 'Main' : 'Branch ' + id);
     scene.add(this.group);
+    this._applyBaseGlow();
 
     // Log timeline creation with position
-  }
-
-  private _toSq(r: number, c: number): string {
-    return String.fromCharCode(97 + c) + (8 - r);
   }
 
   private _fromSq(sq: string): { r: number; c: number } {
@@ -524,36 +544,47 @@ export class TimelineCol implements ITimelineCol {
     this.group.add(trim);
 
     // Squares need per-instance materials for highlighting, but share geometry
-    for (let r = 0; r < 8; r++) {
-      for (let c = 0; c < 8; c++) {
-        const isLight = (r + c) % 2 === 0;
-        // Clone material for per-square color changes (highlights)
-        const mat = new THREE.MeshStandardMaterial({
-          color: isLight ? 0x7575a8 : 0x44446e,
-          metalness: 0.15,
-          roughness: 0.75,
-          side: THREE.FrontSide,
-        });
-        // Use shared PlaneGeometry
-        const mesh = new THREE.Mesh(this.shared.squareGeometry!, mat);
-        mesh.rotation.x = -Math.PI / 2;
-        mesh.position.set(c - 3.5, 0.035, r - 3.5);
-        mesh.receiveShadow = true;
-        mesh.frustumCulled = true;  // Enable frustum culling
-        mesh.userData = {
-          square: this._toSq(r, c),
-          row: r,
-          col: c,
-          origColor: mat.color.getHex(),
-          timelineId: this.id,
-          turn: -1,
-        };
-        this.squareMeshes.push(mesh);
-        this.group.add(mesh);
-      }
+    // All 64 squares in one instanced mesh (one draw call); per-square color via instance colors
+    const squares = new THREE.InstancedMesh(this.shared.squareGeometry!, this.squareMat, 64);
+    const m = new THREE.Matrix4();
+    const rot = new THREE.Quaternion().setFromEuler(new THREE.Euler(-Math.PI / 2, 0, 0));
+    for (let i = 0; i < 64; i++) {
+      const r = Math.floor(i / 8);
+      const c = i % 8;
+      m.compose(new THREE.Vector3(c - 3.5, 0.035, r - 3.5), rot, new THREE.Vector3(1, 1, 1));
+      squares.setMatrixAt(i, m);
+      squares.setColorAt(i, this._squareColor(r, c));
     }
+    squares.userData = { timelineId: this.id, turn: -1, isBoardSquares: true };
+    this.squares = squares;
+    this.group.add(squares);
 
     this._addLabels();
+  }
+
+  /** Floating timeline name above the far edge of the board */
+  private _addNameLabel(name: string): void {
+    const canvas = document.createElement('canvas');
+    canvas.width = 512;
+    canvas.height = 96;
+    const ctx = canvas.getContext('2d')!;
+    const hex = '#' + this.tint.getHexString();
+    ctx.font = '600 52px system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.shadowColor = hex;
+    ctx.shadowBlur = 18;
+    ctx.fillStyle = hex;
+    ctx.fillText(name, 256, 50);
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = 'rgba(255,255,255,0.85)';
+    ctx.fillText(name, 256, 50);
+    const material = new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(canvas), transparent: true, depthWrite: false });
+    const sprite = new THREE.Sprite(material);
+    sprite.position.set(0, 0.6, -5.1);
+    sprite.scale.set(3.2, 0.6, 1);
+    this.nameLabel = sprite;
+    this.group.add(sprite);
   }
 
   private _addLabels(): void {
@@ -640,13 +671,20 @@ export class TimelineCol implements ITimelineCol {
   }
 
   /* highlight / selection */
+  private _squareColor(r: number, c: number): THREE_Color {
+    return (r + c) % 2 === 0 ? LIGHT_SQUARE : DARK_SQUARE;
+  }
+
+  private _setSquareColor(index: number, color: THREE_Color): void {
+    this.squares.setColorAt(index, color);
+    this.squares.instanceColor!.needsUpdate = true;
+  }
+
   select(sq: string): void {
     this.clearHighlights();
     const pos = this._fromSq(sq);
-    const m = this.squareMeshes[pos.r * 8 + pos.c];
-    (m.material as MeshStandardMaterial).color.setHex(0xbba030);
-    (m.material as MeshStandardMaterial).emissive = new THREE.Color(0x554410);
-    this.highlightMeshes.push({ type: 'sq', mesh: m });
+    this.selectedSquare = pos.r * 8 + pos.c;
+    this._setSquareColor(this.selectedSquare, SELECTED_SQUARE);
   }
 
   showLegalMoves(moves: ChessMove[], position: Board): void {
@@ -664,6 +702,17 @@ export class TimelineCol implements ITimelineCol {
       this.group.add(ind);
       this.highlightMeshes.push({ type: 'ind', mesh: ind });
     }
+  }
+
+  /** Slide the piece now standing on `to` from `from` (call after render) */
+  animatePieceMove(from: string, to: string): void {
+    const a = this._fromSq(from);
+    const b = this._fromSq(to);
+    const sprite = this._spriteMap.get(`${b.r},${b.c}`);
+    if (!sprite || from === to) return;
+    for (let i = pieceTweens.length - 1; i >= 0; i--) if (pieceTweens[i].sprite === sprite) pieceTweens.splice(i, 1);
+    pieceTweens.push({ sprite, fromX: a.c - 3.5, fromZ: a.r - 3.5, toX: b.c - 3.5, toZ: b.r - 3.5, start: performance.now() });
+    sprite.position.set(a.c - 3.5, TimelineCol.MAIN_PIECE_Y, a.r - 3.5);
   }
 
   showLastMove(from: string, to: string): void {
@@ -794,17 +843,12 @@ export class TimelineCol implements ITimelineCol {
   }
 
   clearHighlights(): void {
-    for (let i = 0; i < this.highlightMeshes.length; i++) {
-      const h = this.highlightMeshes[i];
-      if (h.type === 'sq') {
-        (h.mesh.material as MeshStandardMaterial).color.setHex(
-          h.mesh.userData.origColor as number
-        );
-        (h.mesh.material as MeshStandardMaterial).emissive = new THREE.Color(0);
-      } else {
-        // Return pooled meshes instead of disposing
-        meshPool.release(h.mesh as PooledMesh);
-      }
+    if (this.selectedSquare !== null) {
+      this._setSquareColor(this.selectedSquare, this._squareColor(Math.floor(this.selectedSquare / 8), this.selectedSquare % 8));
+      this.selectedSquare = null;
+    }
+    for (const h of this.highlightMeshes) {
+      meshPool.release(h.mesh as PooledMesh);
     }
     this.highlightMeshes = [];
   }
@@ -1021,7 +1065,7 @@ export class TimelineCol implements ITimelineCol {
     b.x -= this.xOffset;
     // Softer, more muted colors and much lower opacity for in-board move lines
     const col = isWhite ? 0x6688bb : 0xbb8866;  // Lighter, desaturated blue/red
-    this.moveLineGroup.add(Board3DManager._glowTube(a, b, col, 0.012, 0.04, false, 0.3));  // Thinner, less glow, 30% opacity
+    this.moveLineGroup.add(Board3DManager._glowTube(a, b, col, 0.012, 0.04, false, 0.3, true));  // Thinner, less glow, 30% opacity
 
     // Remove old lines to prevent clutter - keep only last N
     while (this.moveLineGroup.children.length > TimelineCol.MAX_MOVE_LINES) {
@@ -1034,7 +1078,7 @@ export class TimelineCol implements ITimelineCol {
   /* history snapshot */
   addSnapshot(position: Board, moveFrom: string, moveTo: string, isWhite: boolean): void {
     const layerGroup = this._makeHistoryBoard(position);
-    layerGroup.userData = { moveFrom, moveTo, isWhite };
+    Object.assign(layerGroup.userData, { moveFrom, moveTo, isWhite });
     // If in 2D mode, hide the new layer immediately
     if (this._is2DMode) {
       layerGroup.visible = false;
@@ -1050,94 +1094,57 @@ export class TimelineCol implements ITimelineCol {
     this._layoutLayers();
   }
 
+  /**
+   * A history layer is drawn as a single textured plane (squares + pieces painted to a canvas)
+   * instead of 64 square meshes and up to 32 sprites, cutting ~95 draw calls per layer to 2.
+   */
   private _makeHistoryBoard(position: Board): Group {
     const g = new THREE.Group();
-    const turnIndex = this.historyLayers.length;
-    const sqMeshes: Mesh[] = [];
 
-    // Use shared geometry and material for history base
-    const base = new THREE.Mesh(
-      this.shared.historyBaseGeometry!,
-      this.shared.historyBaseMat!
-    );
+    const base = new THREE.Mesh(this.shared.historyBaseGeometry!, this.shared.historyBaseMat!);
     base.position.y = -0.02;
-    base.frustumCulled = true;
     g.add(base);
 
-    // PERFORMANCE OPTIMIZATION: Create just 2 materials per layer (light/dark)
-    // instead of 64 materials per layer. All squares in a layer share the same opacity,
-    // so they can share materials. This reduces material count from 768 to 24 for 12 layers.
-    const layerLightMat = this.shared.historySquareLightMat!.clone();
-    const layerDarkMat = this.shared.historySquareDarkMat!.clone();
+    const texture = this._paintHistoryTexture(position);
+    const material = new THREE.MeshBasicMaterial({ map: texture, transparent: true, opacity: 0.5, depthWrite: false });
+    const plane = new THREE.Mesh(this.shared.historyPlaneGeometry!, material);
+    plane.rotation.x = -Math.PI / 2;
+    plane.position.y = 0.02;
+    plane.userData = { timelineId: this.id, turn: this.historyLayers.length, isHistory: true, isHistoryPlane: true };
+    g.add(plane);
 
-    // Store materials on group for later disposal and opacity updates
-    g.userData.lightMat = layerLightMat;
-    g.userData.darkMat = layerDarkMat;
-
-    // History squares - use shared geometry, per-LAYER materials for opacity control
-    for (let r = 0; r < 8; r++) {
-      for (let c = 0; c < 8; c++) {
-        const isLight = (r + c) % 2 === 0;
-        const m = new THREE.Mesh(
-          this.shared.historySquareGeometry!,
-          isLight ? layerLightMat : layerDarkMat
-        );
-        m.position.set(c - 3.5, 0, r - 3.5);
-        m.frustumCulled = true;
-        m.userData = {
-          square: this._toSq(r, c),
-          row: r,
-          col: c,
-          origColor: (m.material as MeshStandardMaterial).color.getHex(),
-          timelineId: this.id,
-          turn: turnIndex,
-          isHistory: true,
-        };
-        g.add(m);
-        sqMeshes.push(m);
-      }
-    }
-
-    // Pieces - one material per piece texture within this layer (opacity is per layer)
-    const spriteMats = new Map<Texture, SpriteMaterial>();
-    g.userData.spriteMats = spriteMats;
-    for (let r2 = 0; r2 < 8; r2++) {
-      for (let c2 = 0; c2 < 8; c2++) {
-        const piece = position[r2][c2];
-        if (!piece) continue;
-        const isW = piece.color === 'w';
-        const chKey = isW ? piece.type.toUpperCase() : piece.type;
-        const tex = this._pieceTex(this._pieceChars[chKey], isW);
-        let spMat = spriteMats.get(tex);
-        if (!spMat) {
-          spMat = new THREE.SpriteMaterial({ map: tex, transparent: true, opacity: 0.25, depthWrite: false });
-          spriteMats.set(tex, spMat);
-        }
-        const sp = new THREE.Sprite(spMat);
-        sp.position.set(c2 - 3.5, TimelineCol.HISTORY_PIECE_Y, r2 - 3.5);
-        sp.scale.set(0.7, 0.7, 0.7);
-        sp.frustumCulled = true;
-        g.add(sp);
-      }
-    }
-
-    g.userData.sqMeshes = sqMeshes;
-    this.historySquareMeshes = this.historySquareMeshes.concat(sqMeshes);
+    g.userData.plane = plane;
+    g.userData.material = material;
+    g.userData.texture = texture;
     return g;
   }
 
+  /** Paint a board position (squares and piece glyphs) onto a canvas texture */
+  private _paintHistoryTexture(position: Board): Texture {
+    const size = TimelineCol.HISTORY_TEXTURE_SIZE;
+    const sq = size / 8;
+    const canvas = document.createElement('canvas');
+    canvas.width = size;
+    canvas.height = size;
+    const ctx = canvas.getContext('2d')!;
+    for (let r = 0; r < 8; r++) {
+      for (let c = 0; c < 8; c++) {
+        ctx.fillStyle = (r + c) % 2 === 0 ? 'rgba(130,130,190,0.55)' : 'rgba(70,70,120,0.55)';
+        ctx.fillRect(c * sq, r * sq, sq, sq);
+        const piece = position[r][c];
+        if (!piece) continue;
+        const isW = piece.color === 'w';
+        const glyph = this._pieceTex(this._pieceChars[isW ? piece.type.toUpperCase() : piece.type], isW);
+        ctx.drawImage(glyph.image as CanvasImageSource, c * sq + sq * 0.06, r * sq + sq * 0.06, sq * 0.88, sq * 0.88);
+      }
+    }
+    const texture = new THREE.CanvasTexture(canvas);
+    return texture;
+  }
+
   private _removeHistorySquares(layerGroup: Group): void {
-    const toRemove = (layerGroup.userData.sqMeshes as Mesh[]) || [];
-    this.historySquareMeshes = this.historySquareMeshes.filter((m) => toRemove.indexOf(m) === -1);
-
-    // Dispose the per-layer shared materials (just 2 per layer now)
-    const lightMat = layerGroup.userData.lightMat as MeshStandardMaterial | undefined;
-    const darkMat = layerGroup.userData.darkMat as MeshStandardMaterial | undefined;
-    lightMat?.dispose();
-    darkMat?.dispose();
-
-    const spriteMats = layerGroup.userData.spriteMats as Map<Texture, SpriteMaterial> | undefined;
-    spriteMats?.forEach((m) => m.dispose());
+    (layerGroup.userData.texture as Texture | undefined)?.dispose();
+    (layerGroup.userData.material as Material | undefined)?.dispose();
   }
 
   private _layoutLayers(): void {
@@ -1156,11 +1163,7 @@ export class TimelineCol implements ITimelineCol {
       const op = Math.max(0.04, baseOp - i * 0.035);
       this._setGroupOpacity(this.historyLayers[i], op);
 
-      // Update turn indices for history squares
-      const sqs = (this.historyLayers[i].userData.sqMeshes as Mesh[]) || [];
-      for (let j = 0; j < sqs.length; j++) {
-        sqs[j].userData.turn = i;
-      }
+      (this.historyLayers[i].userData.plane as Mesh).userData.turn = i;
     }
 
     // Rebuild inter-layer lines
@@ -1187,24 +1190,18 @@ export class TimelineCol implements ITimelineCol {
       toW.x -= this.xOffset;
       // Softer, more muted inter-layer lines (same as move lines, but keep time travel visible)
       const lineCol = isW ? 0x88bbdd : 0xddaa77;  // Lighter, desaturated cyan/orange
-      this.interLayerGroup.add(Board3DManager._glowTube(fromW, toW, lineCol, 0.018, 0.06, true, 0.4));
+      this.interLayerGroup.add(Board3DManager._glowTube(fromW, toW, lineCol, 0.018, 0.06, true, 0.4, true));
     }
   }
 
   private _setGroupOpacity(group: Group, opacity: number): void {
-    // PERFORMANCE: Update per-layer shared materials directly instead of traversing all children
-    // With shared materials, we only need to set opacity on 2 materials per layer
-    const lightMat = group.userData.lightMat as MeshStandardMaterial | undefined;
-    const darkMat = group.userData.darkMat as MeshStandardMaterial | undefined;
-    if (lightMat) lightMat.opacity = opacity;
-    if (darkMat) darkMat.opacity = opacity;
-
-    const spriteMats = group.userData.spriteMats as Map<Texture, SpriteMaterial> | undefined;
-    spriteMats?.forEach((m) => { m.opacity = opacity * 1.1; });
+    const material = group.userData.material as Material | undefined;
+    // The texture already carries square transparency; scale so the newest layer reads clearly
+    if (material) material.opacity = Math.min(1, opacity * 1.9);
   }
 
   getAllSquareMeshes(): Mesh[] {
-    return this.squareMeshes.concat(this.historySquareMeshes);
+    return [this.squares as unknown as Mesh].concat(this.historyLayers.map((layer) => layer.userData.plane as Mesh));
   }
 
   private _active = false;
@@ -1223,7 +1220,9 @@ export class TimelineCol implements ITimelineCol {
   private _applyBaseGlow(): void {
     const glow = this._highlighted ? 0x446688 : this._active ? 0x2a2a5a : 0x000000;
     this.baseMat.emissive.setHex(glow);
-    this.trimMat.emissive.setHex(this._active ? 0x3a3a88 : 0x000000);
+    // Active board's frame glows in its timeline color
+    this.trimMat.emissive.copy(this.tint).multiplyScalar(this._active ? 0.55 : 0.12);
+    if (this.nameLabel) (this.nameLabel.material as SpriteMaterial).opacity = this._active ? 1 : 0.55;
   }
 
   private _boardGlowState: 'checkmate' | 'draw' | 'none' = 'none';
@@ -1236,11 +1235,8 @@ export class TimelineCol implements ITimelineCol {
 
     // Apply glow to all square meshes on the main board
     const glowIntensity = state === 'draw' ? 0.4 : 0.3;  // Slightly stronger for draw
-    for (const mesh of this.squareMeshes) {
-      const mat = mesh.material as MeshStandardMaterial;
-      mat.emissive.copy(glowColor ?? BLACK);
-      mat.emissiveIntensity = glowColor ? glowIntensity : 0;
-    }
+    this.squareMat.emissive.copy(glowColor ?? BLACK);
+    this.squareMat.emissiveIntensity = glowColor ? glowIntensity : 0;
   }
 
   clearAll(): void {
@@ -1253,7 +1249,6 @@ export class TimelineCol implements ITimelineCol {
       this.group.remove(layer);
     }
     this.historyLayers = [];
-    this.historySquareMeshes = [];
     this.drawnBranchIndices.clear();  // Clear branch tracking
     clearGroup(this.moveLineGroup);
     clearGroup(this.interLayerGroup);
@@ -1275,14 +1270,14 @@ export class TimelineCol implements ITimelineCol {
 
   destroy(): void {
     this.clearAll();
-    // Dispose per-square materials
-    for (const mesh of this.squareMeshes) {
-      if (mesh.material) {
-        (mesh.material as Material).dispose();
-      }
-    }
+    this.squareMat.dispose();
+    this.squares.dispose();
     this.baseMat.dispose();
     this.trimMat.dispose();
+    if (this.nameLabel) {
+      (this.nameLabel.material as SpriteMaterial).map?.dispose();
+      (this.nameLabel.material as SpriteMaterial).dispose();
+    }
     this.scene.remove(this.group);
   }
 
@@ -1302,6 +1297,12 @@ export class TimelineCol implements ITimelineCol {
     this.interLayerGroup.visible = !enabled;
     // Keep move line group visible (blue/orange move indicators on board)
     // this.moveLineGroup stays visible
+
+    // In the tight 2D grid the name sits just above the board edge
+    if (this.nameLabel) {
+      this.nameLabel.position.set(0, 0.6, enabled ? -4.75 : -5.1);
+      this.nameLabel.scale.set(enabled ? 2.6 : 3.2, enabled ? 0.49 : 0.6, 1);
+    }
 
     // Larger pieces in the top-down 2D view
     const targetScale = enabled ? TimelineCol.PIECE_SCALE_2D : TimelineCol.PIECE_SCALE_3D;
@@ -1356,14 +1357,6 @@ class Board3DManager implements IBoard3D {
   private _tempVec3B = new THREE.Vector3();
   private _tempVec3C = new THREE.Vector3();
   private _tempVec3D = new THREE.Vector3();
-
-  // Shared materials for squares (avoid creating 64+ materials per board)
-  private _lightSquareMat: MeshStandardMaterial | null = null;
-  private _darkSquareMat: MeshStandardMaterial | null = null;
-  private _historyLightSquareMat: MeshStandardMaterial | null = null;
-  private _historyDarkSquareMat: MeshStandardMaterial | null = null;
-  private _boardBaseMat: MeshStandardMaterial | null = null;
-  private _boardTrimMat: MeshStandardMaterial | null = null;
 
   timelineCols: Record<number, TimelineCol> = {};
   private branchLineGroup: Group | null = null;
@@ -1464,6 +1457,19 @@ class Board3DManager implements IBoard3D {
   ];
   readonly TIMELINE_SPACING = 12;
 
+  /** Screen position (CSS px, relative to the canvas) of a square's center; used by e2e tests */
+  squareToScreen(timelineId: number, square: string, turn = -1): { x: number; y: number } | null {
+    const col = this.timelineCols[timelineId];
+    if (!col || !this.camera || !this.renderer) return null;
+    const c = square.charCodeAt(0) - 97;
+    const r = 8 - Number(square[1]);
+    const layerY = turn < 0 ? 0.035 : col.historyLayers[turn]?.position.y ?? 0;
+    const v = new THREE.Vector3(col.group.position.x + c - 3.5, layerY + (turn < 0 ? 0 : 0.02), col.group.position.z + r - 3.5);
+    v.project(this.camera);
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    return { x: rect.left + ((v.x + 1) / 2) * rect.width, y: rect.top + ((1 - v.y) / 2) * rect.height };
+  }
+
   /** Mark that a render is needed (called when state changes) */
   markDirty(): void {
     this._needsRender = true;
@@ -1472,69 +1478,6 @@ class Board3DManager implements IBoard3D {
   /** Get current FPS */
   getFps(): number {
     return this._currentFps;
-  }
-
-  /** Initialize shared materials (called once in init) */
-  private _initSharedMaterials(): void {
-    // Main board squares
-    this._lightSquareMat = new THREE.MeshStandardMaterial({
-      color: 0x7575a8,
-      metalness: 0.15,
-      roughness: 0.75,
-      side: THREE.FrontSide,
-    });
-    this._darkSquareMat = new THREE.MeshStandardMaterial({
-      color: 0x44446e,
-      metalness: 0.15,
-      roughness: 0.75,
-      side: THREE.FrontSide,
-    });
-
-    // History layer squares
-    this._historyLightSquareMat = new THREE.MeshStandardMaterial({
-      color: 0x7575a8,
-      transparent: true,
-      opacity: 0.2,
-      metalness: 0.15,
-      roughness: 0.8,
-    });
-    this._historyDarkSquareMat = new THREE.MeshStandardMaterial({
-      color: 0x44446e,
-      transparent: true,
-      opacity: 0.2,
-      metalness: 0.15,
-      roughness: 0.8,
-    });
-
-    // Board base and trim
-    this._boardBaseMat = new THREE.MeshStandardMaterial({
-      color: 0x15152a,
-      metalness: 0.7,
-      roughness: 0.3,
-    });
-    this._boardTrimMat = new THREE.MeshStandardMaterial({
-      color: 0x333366,
-      metalness: 0.9,
-      roughness: 0.2,
-    });
-  }
-
-  /** Get shared material for square type */
-  getSquareMaterial(isLight: boolean, isHistory: boolean = false): MeshStandardMaterial {
-    if (isHistory) {
-      return isLight ? this._historyLightSquareMat! : this._historyDarkSquareMat!;
-    }
-    return isLight ? this._lightSquareMat! : this._darkSquareMat!;
-  }
-
-  /** Get shared board base material */
-  getBoardBaseMaterial(): MeshStandardMaterial {
-    return this._boardBaseMat!;
-  }
-
-  /** Get shared board trim material */
-  getBoardTrimMaterial(): MeshStandardMaterial {
-    return this._boardTrimMat!;
   }
 
   init(
@@ -1551,8 +1494,6 @@ class Board3DManager implements IBoard3D {
     this.raycaster = new THREE.Raycaster();
     this.mouse = new THREE.Vector2();
 
-    // Initialize shared materials for performance
-    this._initSharedMaterials();
     // Initialize shared resources singleton
     SharedResources.getInstance();
 
@@ -1700,6 +1641,7 @@ class Board3DManager implements IBoard3D {
       this.scene!,
       id,
       xOffset,
+      this.TIMELINE_COLORS[id % this.TIMELINE_COLORS.length],
       this.PIECE_CHARS,
       this._pieceTexture.bind(this)
     );
@@ -1933,6 +1875,21 @@ class Board3DManager implements IBoard3D {
     }
   }
 
+  /** Connection-line metadata, for saving/restoring a game */
+  exportLines(): unknown[] {
+    return this._branchLineData.map((d) => ({ ...d }));
+  }
+
+  /** Restore connection lines saved with exportLines(); restored lines appear already settled */
+  importLines(lines: unknown[]): void {
+    const now = this._clock?.getElapsedTime() ?? 0;
+    this._branchLineData = (lines as typeof this._branchLineData).map((d) =>
+      d.type === 'cross' ? { ...d, createdAt: now - Board3DManager.CROSS_LINE_FADE_DURATION - 1 } : { ...d }
+    );
+    this._rebuildBranchLines();
+    this._needsRender = true;
+  }
+
   /** Notify that a timeline's snapshots have changed - triggers branch line rebuild */
   notifySnapshotAdded(timelineId: number): void {
     // Rebuild branch lines whenever any timeline gets a new snapshot
@@ -1955,6 +1912,8 @@ class Board3DManager implements IBoard3D {
   focusTimeline(id: number, animate: boolean): void {
     const col = this.timelineCols[id];
     if (!col || !this.controls || !this.camera || !this._clock) return;
+    // The 2D grid already shows every board; panning would push it off screen
+    if (this._is2DMode) return;
 
     const targetX = col.xOffset;
     const currentTarget = this.controls.target.clone();
@@ -2110,6 +2069,10 @@ class Board3DManager implements IBoard3D {
   }
 
   /* glow tube (static helper) */
+  /**
+   * Glowing line between two points. `lite` tubes (small in-board connectors) use just a soft
+   * glow and a core; full tubes add a mid glow layer and end caps.
+   */
   static _glowTube(
     from: Vector3,
     to: Vector3,
@@ -2117,7 +2080,8 @@ class Board3DManager implements IBoard3D {
     coreR: number,
     glowR: number,
     arc: boolean,
-    opacityScale: number = 1.0
+    opacityScale: number = 1.0,
+    lite = false
   ): Group {
     const group = new THREE.Group();
     let curve: Curve<Vector3>;
@@ -2127,12 +2091,10 @@ class Board3DManager implements IBoard3D {
       const dist = from.distanceTo(to);
       const yLift = Math.max(1.5, dist * 0.25);
       mid.y = Math.max(from.y, to.y) + yLift;
-      // Slight horizontal offset for visual separation
+      // Perpendicular nudge so parallel lines don't overlap
       const hDir = new THREE.Vector2(to.x - from.x, to.z - from.z);
-      const hLen = hDir.length();
-      if (hLen > 0.01) {
+      if (hDir.length() > 0.01) {
         hDir.normalize();
-        // Perpendicular nudge so parallel lines don't overlap
         mid.x += -hDir.y * 0.5;
         mid.z += hDir.x * 0.5;
       }
@@ -2140,61 +2102,35 @@ class Board3DManager implements IBoard3D {
     } else {
       curve = new THREE.LineCurve3(from, to);
     }
-    const segs = arc ? 24 : 8;
+    const segs = arc ? (lite ? 16 : 24) : 1;
+    const radial = lite ? 6 : 8;
+    const glowMat = (opacity: number, white = false) =>
+      new THREE.MeshBasicMaterial({
+        color: white ? 0xffffff : color,
+        transparent: true,
+        opacity: opacity * opacityScale,
+        blending: THREE.AdditiveBlending,
+        side: white ? THREE.FrontSide : THREE.DoubleSide,
+        depthWrite: false,
+      });
 
-    group.add(
-      new THREE.Mesh(
-        new THREE.TubeGeometry(curve, segs, glowR, 8, false),
-        new THREE.MeshBasicMaterial({
-          color,
-          transparent: true,
-          opacity: 0.1 * opacityScale,
-          blending: THREE.AdditiveBlending,
-          side: THREE.DoubleSide,
-          depthWrite: false,
-        })
-      )
-    );
-    group.add(
-      new THREE.Mesh(
-        new THREE.TubeGeometry(curve, segs, glowR * 0.45, 8, false),
-        new THREE.MeshBasicMaterial({
-          color,
-          transparent: true,
-          opacity: 0.22 * opacityScale,
-          blending: THREE.AdditiveBlending,
-          side: THREE.DoubleSide,
-          depthWrite: false,
-        })
-      )
-    );
-    group.add(
-      new THREE.Mesh(
-        new THREE.TubeGeometry(curve, segs, coreR, 8, false),
-        new THREE.MeshBasicMaterial({
-          color: 0xffffff,
-          transparent: true,
-          opacity: 0.75 * opacityScale,
-          blending: THREE.AdditiveBlending,
-          depthWrite: false,
-        })
-      )
-    );
+    // Outer glow first: the ambient pulse animates children[0]
+    group.add(new THREE.Mesh(new THREE.TubeGeometry(curve, segs, glowR, radial, false), glowMat(0.1)));
+    if (!lite) {
+      group.add(new THREE.Mesh(new THREE.TubeGeometry(curve, segs, glowR * 0.45, radial, false), glowMat(0.22)));
+    }
+    group.add(new THREE.Mesh(new THREE.TubeGeometry(curve, segs, coreR, radial, false), glowMat(0.75, true)));
 
-    const sg = new THREE.SphereGeometry(coreR * 2.2, 12, 12);
-    const sm = new THREE.MeshBasicMaterial({
-      color,
-      transparent: true,
-      opacity: 0.6 * opacityScale,
-      blending: THREE.AdditiveBlending,
-      depthWrite: false,
-    });
-    const s1 = new THREE.Mesh(sg, sm);
-    s1.position.copy(from);
-    group.add(s1);
-    const s2 = new THREE.Mesh(sg.clone(), sm.clone());
-    s2.position.copy(to);
-    group.add(s2);
+    if (!lite) {
+      const capGeo = new THREE.SphereGeometry(coreR * 2.2, 10, 8);
+      for (const p of [from, to]) {
+        const cap = new THREE.Mesh(capGeo.clone(), glowMat(0.6));
+        cap.position.copy(p);
+        group.add(cap);
+      }
+      capGeo.dispose();
+    }
+
     // Remember unscaled opacities so fades can rescale without compounding
     group.traverse((obj: Object3D) => {
       const mat = (obj as Mesh).material as Material | undefined;
@@ -2342,6 +2278,8 @@ class Board3DManager implements IBoard3D {
     this.mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
     this.mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
     this.raycaster.setFromCamera(this.mouse, this.camera);
+    // Objects added since the last frame (e.g. a new history layer) have stale world matrices
+    this.scene?.updateMatrixWorld();
 
     // Collect all clickable squares across all timelines
     let allMeshes: Mesh[] = [];
@@ -2355,6 +2293,26 @@ class Board3DManager implements IBoard3D {
     const hit = this.raycaster.intersectObjects(allMeshes).find((h) => isShown(h.object));
     if (hit && this.onSquareClick) {
       const ud = hit.object.userData;
+      if (ud.isBoardSquares && hit.instanceId !== undefined) {
+        this.onSquareClick({
+          timelineId: ud.timelineId as number,
+          square: String.fromCharCode(97 + (hit.instanceId % 8)) + (8 - Math.floor(hit.instanceId / 8)),
+          turn: -1,
+          isHistory: false,
+        });
+        return;
+      }
+      if (ud.isHistoryPlane && hit.uv) {
+        const c = Math.min(7, Math.floor(hit.uv.x * 8));
+        const r = Math.min(7, Math.floor((1 - hit.uv.y) * 8));
+        this.onSquareClick({
+          timelineId: ud.timelineId as number,
+          square: String.fromCharCode(97 + c) + (8 - r),
+          turn: ud.turn as number,
+          isHistory: true,
+        });
+        return;
+      }
       this.onSquareClick({
         timelineId: ud.timelineId as number,
         square: ud.square as string,
@@ -2444,6 +2402,11 @@ class Board3DManager implements IBoard3D {
     }
 
     // Update visual effects
+    if (pieceTweens.length > 0) {
+      updatePieceTweens(performance.now());
+      this._needsRender = true;
+    }
+
     if (this._activeEffects.length > 0) {
       this._updateEffects();
       this._needsRender = true;
@@ -2617,11 +2580,7 @@ class Board3DManager implements IBoard3D {
       this.timelineCols[key].destroy();
     }
     this.timelineCols = {};
-    if (this.branchLineGroup) {
-      while (this.branchLineGroup.children.length) {
-        this.branchLineGroup.remove(this.branchLineGroup.children[0]);
-      }
-    }
+    if (this.branchLineGroup) clearGroup(this.branchLineGroup);
     // Clear branch line metadata and cross-line mesh tracking
     this._branchLineData = [];
     this._crossLineMeshes = [];
@@ -2696,18 +2655,6 @@ class Board3DManager implements IBoard3D {
     this._activeEffects = [];
 
     // Dispose shared materials
-    this._lightSquareMat?.dispose();
-    this._darkSquareMat?.dispose();
-    this._historyLightSquareMat?.dispose();
-    this._historyDarkSquareMat?.dispose();
-    this._boardBaseMat?.dispose();
-    this._boardTrimMat?.dispose();
-    this._lightSquareMat = null;
-    this._darkSquareMat = null;
-    this._historyLightSquareMat = null;
-    this._historyDarkSquareMat = null;
-    this._boardBaseMat = null;
-    this._boardTrimMat = null;
 
     // Dispose texture cache
     for (const key in this._texCache) {
@@ -2962,6 +2909,7 @@ class Board3DManager implements IBoard3D {
   set2DMode(enabled: boolean): void {
     if (!this.camera || !this.controls) return;
     if (this._is2DMode === enabled) return;
+    this._focusTween = undefined;
 
     if (enabled) {
       // Save current camera state
@@ -2977,6 +2925,7 @@ class Board3DManager implements IBoard3D {
       this._pre2DBoardPositions.clear();
       const boardSize = 8;
       const gridSpacing = 9; // Tight spacing for 2D grid (just 1 unit gap between boards)
+      const rowSpacing = 10; // Extra room between rows for the board name labels
       const numBoards = timelineIds.length;
 
       // Calculate grid dimensions (prefer wider grids)
@@ -2985,7 +2934,7 @@ class Board3DManager implements IBoard3D {
 
       // Grid dimensions
       const gridWidth = (cols - 1) * gridSpacing;
-      const gridDepth = (rows - 1) * gridSpacing;
+      const gridDepth = (rows - 1) * rowSpacing;
 
       // Sort timelines by original xOffset for consistent ordering
       const sortedIds = timelineIds.sort((a, b) => {
@@ -3008,7 +2957,7 @@ class Board3DManager implements IBoard3D {
 
         // Center the grid
         const newX = gridCol * gridSpacing - gridWidth / 2;
-        const newZ = gridRow * gridSpacing - gridDepth / 2;
+        const newZ = gridRow * rowSpacing - gridDepth / 2;
 
         // Update position
         col.xOffset = newX;
@@ -3110,13 +3059,18 @@ class Board3DManager implements IBoard3D {
       if (x > maxX) maxX = x;
     }
 
+    // Fit the row of boards (each ~9 units wide, history stacks hanging below) into the
+    // camera's horizontal field of view, viewed from the default elevated angle
     const centerX = (minX + maxX) / 2;
-    const extent = maxX - minX;
-    // Position camera to see all boards with generous padding
-    const distance = Math.max(35, extent * 0.9 + 20);
+    const halfWidth = (maxX - minX) / 2 + 6;
+    const vFov = (this.camera.fov * Math.PI) / 180;
+    const hFov = 2 * Math.atan(Math.tan(vFov / 2) * this.camera.aspect);
+    const distance = Math.max(22, (halfWidth / Math.tan(hFov / 2)) * 1.05);
+    const dir = new THREE.Vector3(0, 0.75, 0.66).normalize();
 
-    this.controls.target.set(centerX, 0, 0);
-    this.camera.position.set(centerX, distance * 0.75, distance * 0.5);
+    this._focusTween = undefined;  // an in-flight focus animation would drag the view back
+    this.controls.target.set(centerX, -3, 0);
+    this.camera.position.set(centerX + dir.x * distance, -3 + dir.y * distance, dir.z * distance);
 
     this._zoomedIn = false;
     this._needsRender = true;
