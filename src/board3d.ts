@@ -51,6 +51,33 @@ const pieceMaterialCache = new Map<Texture, SpriteMaterial>();
 // Board coordinate labels are identical on every board, so share them
 const labelMaterialCache = new Map<string, SpriteMaterial>();
 
+// Piece slide animations, advanced by Board3DManager's render loop
+interface PieceTween {
+  sprite: Sprite;
+  fromX: number;
+  fromZ: number;
+  toX: number;
+  toZ: number;
+  start: number;
+}
+const PIECE_SLIDE_MS = 220;
+const pieceTweens: PieceTween[] = [];
+
+/** Advance piece slides; returns true while any are running */
+function updatePieceTweens(now: number): boolean {
+  for (let i = pieceTweens.length - 1; i >= 0; i--) {
+    const t = pieceTweens[i];
+    const k = Math.min(1, (now - t.start) / PIECE_SLIDE_MS);
+    const e = 1 - Math.pow(1 - k, 3); // ease-out cubic
+    t.sprite.position.x = t.fromX + (t.toX - t.fromX) * e;
+    t.sprite.position.z = t.fromZ + (t.toZ - t.fromZ) * e;
+    // Small hop so the piece reads as moving over the board
+    t.sprite.position.y = TimelineCol.MAIN_PIECE_Y + Math.sin(Math.PI * e) * 0.25;
+    if (k >= 1) pieceTweens.splice(i, 1);
+  }
+  return pieceTweens.length > 0;
+}
+
 const BLACK = new THREE.Color(0x000000);
 const LIGHT_SQUARE = new THREE.Color(0x7878ac);
 const DARK_SQUARE = new THREE.Color(0x45456f);
@@ -363,6 +390,8 @@ class SpritePool {
   }
 
   release(sprite: PooledSprite): void {
+    // A released sprite may be reused elsewhere; stop any slide still driving it
+    for (let i = pieceTweens.length - 1; i >= 0; i--) if (pieceTweens[i].sprite === sprite) pieceTweens.splice(i, 1);
     sprite.parent?.remove(sprite);
     sprite.visible = false;
     if (this.pool.length < this.maxPoolSize) this.pool.push(sprite);
@@ -673,6 +702,17 @@ export class TimelineCol implements ITimelineCol {
       this.group.add(ind);
       this.highlightMeshes.push({ type: 'ind', mesh: ind });
     }
+  }
+
+  /** Slide the piece now standing on `to` from `from` (call after render) */
+  animatePieceMove(from: string, to: string): void {
+    const a = this._fromSq(from);
+    const b = this._fromSq(to);
+    const sprite = this._spriteMap.get(`${b.r},${b.c}`);
+    if (!sprite || from === to) return;
+    for (let i = pieceTweens.length - 1; i >= 0; i--) if (pieceTweens[i].sprite === sprite) pieceTweens.splice(i, 1);
+    pieceTweens.push({ sprite, fromX: a.c - 3.5, fromZ: a.r - 3.5, toX: b.c - 3.5, toZ: b.r - 3.5, start: performance.now() });
+    sprite.position.set(a.c - 3.5, TimelineCol.MAIN_PIECE_Y, a.r - 3.5);
   }
 
   showLastMove(from: string, to: string): void {
@@ -2215,6 +2255,8 @@ class Board3DManager implements IBoard3D {
     this.mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
     this.mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
     this.raycaster.setFromCamera(this.mouse, this.camera);
+    // Objects added since the last frame (e.g. a new history layer) have stale world matrices
+    this.scene?.updateMatrixWorld();
 
     // Collect all clickable squares across all timelines
     let allMeshes: Mesh[] = [];
@@ -2337,6 +2379,11 @@ class Board3DManager implements IBoard3D {
     }
 
     // Update visual effects
+    if (pieceTweens.length > 0) {
+      updatePieceTweens(performance.now());
+      this._needsRender = true;
+    }
+
     if (this._activeEffects.length > 0) {
       this._updateEffects();
       this._needsRender = true;

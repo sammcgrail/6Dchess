@@ -1192,6 +1192,7 @@ timelines - list timelines`,
 
     this.clearSelection();
     this.renderTimeline(tlId);
+    col?.animatePieceMove(move.from, move.to);
     this._afterMove();
     return true;
   }
