@@ -38,6 +38,28 @@ import {
 import { stockfish } from './stockfish';
 import { sound } from './sound';
 
+const SAVE_KEY = '6dchess-save';
+// Mirrors TimelineCol.MAX_LAYERS (history boards shown under each board)
+const TIMELINE_MAX_LAYERS = 12;
+
+interface SavedGame {
+  version: 1;
+  activeTimelineId: number;
+  nextTimelineId: number;
+  cpuGlobalTurn: PieceColor;
+  lines: unknown[];
+  timelines: Array<{
+    id: number;
+    name: string;
+    parentId: number | null;
+    branchTurn: number;
+    xOffset: number;
+    fen: string;
+    moveHistory: Move[];
+    snapshots: string[];
+  }>;
+}
+
 class GameManager {
   private timelines: Record<number, TimelineData> = {};
   private activeTimelineId = 0;
@@ -52,6 +74,9 @@ class GameManager {
 
   // Time travel movement state (queen moving backward in time)
   private timeTravelSelection: TimeTravelSelection | null = null;
+
+  // Previous game states for undo (most recent last)
+  private undoStack: SavedGame[] = [];
 
   // Cached state for optimized re-renders (avoid unnecessary DOM updates)
   private _lastMoveListHtml = '';
@@ -101,12 +126,15 @@ class GameManager {
     // Setup timeline panel resize and collapse
     this._setupTimelinePanel();
 
-    // Create the main timeline
-    this._createTimeline(0, 0, null, -1, null);
-    this.setActiveTimeline(0);
-    this.renderTimeline(0);
-    this.updateStatus();
-    this.updateTimelineList();
+    // Resume the autosaved game, or start fresh
+    if (!this._restoreSave()) {
+      this._createTimeline(0, 0, null, -1, null);
+      this.setActiveTimeline(0);
+      this.renderTimeline(0);
+    }
+    this._refreshUi();
+
+    document.getElementById('undo')?.addEventListener('click', () => this.undo());
 
     // Setup collapsible shortcuts panel
     this._setupCollapsibleShortcuts();
@@ -269,6 +297,12 @@ class GameManager {
         e.target instanceof HTMLInputElement ||
         e.target instanceof HTMLTextAreaElement
       ) {
+        return;
+      }
+
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
+        e.preventDefault();
+        this.undo();
         return;
       }
 
@@ -1177,11 +1211,14 @@ timelines - list timelines`,
     const moveObj: { from: string; to: string; promotion?: PieceType } = { from: move.from, to: move.to };
     if (isPromotion) moveObj.promotion = promotionPiece || 'q';
 
+    const undoState = this.exportState();
     const result = chess.move(moveObj);
     if (!result) {
       console.error('Invalid move:', moveObj);
       return false;
     }
+    this.undoStack.push(undoState);
+    if (this.undoStack.length > 100) this.undoStack.shift();
 
     // Use result.captured (actual move result) instead of move.captured (potential move)
     tl.moveHistory.push({
@@ -1293,6 +1330,7 @@ timelines - list timelines`,
       return false;
     }
 
+    this._pushUndo();
     const isWhite = piece.color === 'w';
     const sourceBoardBefore = this._cloneBoard(sourceTl.chess);
     const targetBoardBefore = this._cloneBoard(targetTl.chess);
@@ -1416,6 +1454,8 @@ timelines - list timelines`,
     const isWhite = piece.color === 'w';
     const pieceChar = piece.type.toUpperCase();
 
+    this._pushUndo();
+
     // 1. Piece departs the source timeline
     const sourceBoardBefore = this._cloneBoard(sourceTl.chess);
     sourceTl.chess.load(plan.sourceFen);
@@ -1459,13 +1499,7 @@ timelines - list timelines`,
     });
     this._validateSnapshotConsistency(newTl);
 
-    const newCol = Board3D.getTimeline(newId);
-    if (newCol) {
-      for (let h = newTl.moveHistory.length - 1; h >= 0; h--) {
-        const mv = newTl.moveHistory[h];
-        newCol.addSnapshot(this._getSnapshotBoard(newTl.snapshots[h]), mv.from, mv.to, mv.isWhite);
-      }
-    }
+    this._buildHistoryLayers(newTl);
 
     // 3. Connection line (vertical drop then horizontal)
     Board3D.addTimeTravelLine(sourceTimelineId, targetTurnIndex, newId, sourceSquare, isWhite);
@@ -1486,12 +1520,147 @@ timelines - list timelines`,
     return true;
   }
 
-  /** Shared UI refresh after any committed move */
-  private _afterMove(): void {
+  /** Add a history layer for every past position (oldest first, so the newest ends on top) */
+  private _buildHistoryLayers(tl: TimelineData): void {
+    const col = Board3D.getTimeline(tl.id);
+    if (!col) return;
+    const start = Math.max(0, tl.moveHistory.length - TIMELINE_MAX_LAYERS);
+    for (let h = start; h < tl.moveHistory.length; h++) {
+      const mv = tl.moveHistory[h];
+      col.addSnapshot(this._getSnapshotBoard(tl.snapshots[h]), mv.from, mv.to, mv.isWhite);
+    }
+  }
+
+  /* -- Save / restore / undo -- */
+
+  /** Serializable snapshot of the whole multiverse (snapshots stored as FEN only) */
+  exportState(): SavedGame {
+    return {
+      version: 1,
+      activeTimelineId: this.activeTimelineId,
+      nextTimelineId: this.nextTimelineId,
+      cpuGlobalTurn: this.cpuGlobalTurn,
+      lines: Board3D.exportLines(),
+      timelines: Object.values(this.timelines).map((tl) => ({
+        id: tl.id,
+        name: tl.name,
+        parentId: tl.parentId,
+        branchTurn: tl.branchTurn,
+        xOffset: tl.xOffset,
+        fen: tl.chess.fen(),
+        moveHistory: tl.moveHistory.map((m) => ({ ...m })),
+        snapshots: tl.snapshots.map((snap) => this._getSnapshotFen(snap) ?? ''),
+      })),
+    };
+  }
+
+  /** Rebuild the game (data and 3D scene) from exportState() output. Returns false if invalid. */
+  importState(state: SavedGame): boolean {
+    if (!state || state.version !== 1 || !Array.isArray(state.timelines) || state.timelines.length === 0) return false;
+    const rebuilt: Record<number, TimelineData> = {};
+    for (const saved of state.timelines) {
+      const chess = new Chess();
+      if (!chess.load(saved.fen) || saved.snapshots.length !== saved.moveHistory.length + 1) return false;
+      const snapshots: Snapshot[] = [];
+      for (const fen of saved.snapshots) {
+        const snapChess = new Chess();
+        if (!snapChess.load(fen)) return false;
+        snapshots.push(this._cloneBoard(snapChess));
+      }
+      rebuilt[saved.id] = {
+        id: saved.id,
+        name: saved.name,
+        parentId: saved.parentId,
+        branchTurn: saved.branchTurn,
+        xOffset: saved.xOffset,
+        chess,
+        moveHistory: saved.moveHistory,
+        snapshots,
+      };
+    }
+
+    this.cpuStop();
+    this._stopExamplePlay();
+    this.clearSelection();
+    Board3D.clearAll();
+    this.timelines = rebuilt;
+    this.nextTimelineId = state.nextTimelineId;
+    this.cpuGlobalTurn = state.cpuGlobalTurn;
+    this.viewingMoveIndex = null;
+    this._lastMoveListHtml = '';
+    this._lastTimelineStructure = '';
+    document.getElementById('game-end-toast')?.remove();
+
+    for (const tl of Object.values(rebuilt).sort((a, b) => a.id - b.id)) {
+      Board3D.createTimeline(tl.id, tl.xOffset);
+      this._buildHistoryLayers(tl);
+      this.renderTimeline(tl.id);
+    }
+    Board3D.importLines(state.lines ?? []);
+    if (Board3D.is2DMode()) {
+      Board3D.set2DMode(false);
+      Board3D.set2DMode(true);
+    }
+    this.setActiveTimeline(rebuilt[state.activeTimelineId] ? state.activeTimelineId : 0, true);
+    this._refreshUi();
+    return true;
+  }
+
+  /** Remember the position before a move so it can be undone */
+  private _pushUndo(): void {
+    this.undoStack.push(this.exportState());
+    if (this.undoStack.length > 100) this.undoStack.shift();
+  }
+
+  /** Undo the last move (any kind). Stops the CPU so it doesn't immediately replay. */
+  undo(): boolean {
+    const previous = this.undoStack.pop();
+    if (!previous) return false;
+    return this.importState(previous);
+  }
+
+  private _autosave(): void {
+    try {
+      localStorage.setItem(SAVE_KEY, JSON.stringify(this.exportState()));
+    } catch {
+      // storage full or unavailable - autosave is best effort
+    }
+  }
+
+  private _clearSave(): void {
+    try {
+      localStorage.removeItem(SAVE_KEY);
+    } catch {
+      // ignore
+    }
+  }
+
+  /** Restore the autosaved game, if any. Returns true when a game was restored. */
+  private _restoreSave(): boolean {
+    try {
+      const raw = localStorage.getItem(SAVE_KEY);
+      if (!raw) return false;
+      const state = JSON.parse(raw) as SavedGame;
+      const hasMoves = state.timelines?.some((tl) => tl.moveHistory.length > 0);
+      return hasMoves ? this.importState(state) : false;
+    } catch {
+      return false;
+    }
+  }
+
+  private _refreshUi(): void {
     this.updateStatus();
     this.updateMoveList();
     this.updateTimelineList();
     this._updateMoveSlider();
+    const undoBtn = document.getElementById('undo') as HTMLButtonElement | null;
+    if (undoBtn) undoBtn.disabled = this.undoStack.length === 0;
+  }
+
+  /** Shared UI refresh after any committed move */
+  private _afterMove(): void {
+    this._refreshUi();
+    this._autosave();
     // The CPU loop reports game end itself; human games need it here
     if (!this.cpuEnabled && this.isGlobalGameOver()) {
       this._handleGameEnd();
@@ -2154,6 +2323,8 @@ timelines - list timelines`,
     this.cpuStop();
     this.cpuGlobalTurn = 'w';
     this.clearSelection();
+    this.undoStack = [];
+    this._clearSave();
 
     Board3D.clearAll();
     this.timelines = {};

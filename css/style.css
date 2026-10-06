@@ -1823,3 +1823,21 @@ summary:focus-visible {
 .sound-toggle.muted .off {
     display: block;
 }
+
+#undo {
+    flex: 0 0 2.6rem;
+    font-size: 1.15rem;
+    background: rgba(55, 55, 95, 0.6);
+    color: var(--text);
+    border: 1px solid rgba(80, 80, 160, 0.3);
+    cursor: pointer;
+}
+
+#undo:hover:not(:disabled) {
+    background: rgba(75, 75, 125, 0.7);
+}
+
+#undo:disabled {
+    opacity: 0.35;
+    cursor: default;
+}

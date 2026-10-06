@@ -14,7 +14,7 @@
     </script>
     <title>6D Chess</title>
     <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>♟️</text></svg>">
-    <link rel="stylesheet" href="css/style.css?v=2ed17a143a">
+    <link rel="stylesheet" href="css/style.css?v=2c094d4807">
 </head>
 <body>
     <div id="app">
@@ -34,6 +34,7 @@
                 <button id="reset">New Game</button>
                 <button id="cpu-toggle">Start CPU</button>
                 <button id="example-play" title="Run scripted example game">▶ Demo</button>
+                <button id="undo" title="Undo last move (Ctrl+Z)" aria-label="Undo" disabled>↶</button>
             </div>
             <div id="timeline-panel">
                 <div id="timeline-header">
@@ -119,6 +120,8 @@
                     <div class="shortcut-row"><span class="key">Q / E</span> Rotate view</div>
                     <div class="shortcut-row"><span class="key">C</span> Reset camera</div>
                     <div class="shortcut-row"><span class="key">Space</span> Flip board</div>
+                    <div class="shortcut-group">Game</div>
+                    <div class="shortcut-row"><span class="key">Ctrl+Z</span> Undo move</div>
                     <div class="shortcut-group">Navigation</div>
                     <div class="shortcut-row"><span class="key">Left/Right</span> Prev/next move</div>
                     <div class="shortcut-row"><span class="key">Home/End</span> First/last move</div>
@@ -145,6 +148,6 @@
     <script src="lib/OrbitControls.js"></script>
     <!-- Stockfish chess engine loads via Web Worker from lib/stockfish-worker.js -->
     <!-- TypeScript compiled bundle (with cache buster) -->
-    <script src="dist/bundle.js?v=c3dc8f8a07"></script>
+    <script src="dist/bundle.js?v=33cc694a19"></script>
 </body>
 </html>

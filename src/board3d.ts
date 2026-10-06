@@ -1869,6 +1869,21 @@ class Board3DManager implements IBoard3D {
     }
   }
 
+  /** Connection-line metadata, for saving/restoring a game */
+  exportLines(): unknown[] {
+    return this._branchLineData.map((d) => ({ ...d }));
+  }
+
+  /** Restore connection lines saved with exportLines(); restored lines appear already settled */
+  importLines(lines: unknown[]): void {
+    const now = this._clock?.getElapsedTime() ?? 0;
+    this._branchLineData = (lines as typeof this._branchLineData).map((d) =>
+      d.type === 'cross' ? { ...d, createdAt: now - Board3DManager.CROSS_LINE_FADE_DURATION - 1 } : { ...d }
+    );
+    this._rebuildBranchLines();
+    this._needsRender = true;
+  }
+
   /** Notify that a timeline's snapshots have changed - triggers branch line rebuild */
   notifySnapshotAdded(timelineId: number): void {
     // Rebuild branch lines whenever any timeline gets a new snapshot
@@ -2557,11 +2572,7 @@ class Board3DManager implements IBoard3D {
       this.timelineCols[key].destroy();
     }
     this.timelineCols = {};
-    if (this.branchLineGroup) {
-      while (this.branchLineGroup.children.length) {
-        this.branchLineGroup.remove(this.branchLineGroup.children[0]);
-      }
-    }
+    if (this.branchLineGroup) clearGroup(this.branchLineGroup);
     // Clear branch line metadata and cross-line mesh tracking
     this._branchLineData = [];
     this._crossLineMeshes = [];
