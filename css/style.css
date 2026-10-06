@@ -2006,3 +2006,22 @@ summary:focus-visible {
 .move.future {
     opacity: 0.35;
 }
+
+/* ===============================================================
+   iOS Safari: fit the visible viewport and clear its floating toolbar
+   =============================================================== */
+
+#app {
+    height: 100vh;   /* fallback for browsers without dynamic viewport units */
+    height: 100dvh;  /* excludes Safari's collapsing URL bar / toolbars */
+}
+
+@media (max-width: 700px) {
+    /* Safari's floating bottom toolbar overlays the page, so the stacked sidebar
+       needs room at the end for its last row to scroll clear of the toolbar */
+    #sidebar {
+        max-height: 50dvh;
+        padding-bottom: calc(env(safe-area-inset-bottom, 0px) + 88px);
+        overscroll-behavior: contain;
+    }
+}
