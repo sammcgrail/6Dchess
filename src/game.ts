@@ -36,6 +36,7 @@ import {
   scoreMultiverseMove,
 } from './rules';
 import { stockfish } from './stockfish';
+import { boardPriority, materialBalance, pickMultiverseMove } from './cpuStrategy';
 import { sound } from './sound';
 
 const SAVE_KEY = '6dchess-save';
@@ -2626,24 +2627,6 @@ timelines - list timelines`,
   }
 
   /**
-   * Evaluate material balance on a timeline (positive = white advantage)
-   * Used for 5D-aware timeline prioritization
-   */
-  private _evaluateMaterial(fen: string): number {
-    const pieceValues: Record<string, number> = { p: 1, n: 3, b: 3, r: 5, q: 9, k: 0 };
-    let score = 0;
-    const boardPart = fen.split(' ')[0];
-    for (const char of boardPart) {
-      const piece = char.toLowerCase();
-      if (pieceValues[piece] !== undefined) {
-        const value = pieceValues[piece];
-        score += char === char.toUpperCase() ? value : -value; // Upper = white
-      }
-    }
-    return score;
-  }
-
-  /**
    * Pick the best timeline to play on (5D-aware selection)
    * Prioritizes timelines where:
    * - We have check opportunities
@@ -2652,41 +2635,18 @@ timelines - list timelines`,
    */
   private _cpuSelectBestTimeline(playable: number[]): number {
     if (playable.length === 1) return playable[0];
-
-    const isWhite = this.cpuGlobalTurn === 'w';
+    const avgMoves = playable.reduce((sum, id) => sum + (this.timelines[id]?.moveHistory.length || 0), 0) / playable.length;
     let bestTlId = playable[0];
     let bestScore = -Infinity;
-    const avgMoves = playable.reduce((sum, id) => sum + (this.timelines[id]?.moveHistory.length || 0), 0) / playable.length;
-
     for (const tlId of playable) {
       const tl = this.timelines[tlId];
       if (!tl) continue;
-
-      let score = 0;
-      const chess = tl.chess;
-      const moves = chess.moves({ verbose: true }) as ChessMove[];
-      // Check opportunities, being in check, captures
-      if (moves.some((m) => m.san?.includes('+'))) score += 50;
-      if (chess.in_check()) score += 40;
-      score += moves.filter((m) => m.captured).length * 5;
-
-      // Press an advantage or defend a weakness
-      const material = this._evaluateMaterial(chess.fen());
-      const advantage = isWhite ? material : -material;
-      score += advantage > 0 ? advantage * 3 : Math.abs(advantage) * 2;
-
-      // Balance play across boards (prefer less-played timelines)
-      const moveCount = tl.moveHistory.length;
-      if (moveCount < avgMoves * 0.5) score += 20;
-      else if (moveCount < avgMoves * 0.8) score += 10;
-
-      score += Math.random() * 5;
+      const score = boardPriority(tl.chess.fen(), tl.moveHistory.length, avgMoves);
       if (score > bestScore) {
         bestScore = score;
         bestTlId = tlId;
       }
     }
-
     return bestTlId;
   }
 
@@ -2782,23 +2742,6 @@ timelines - list timelines`,
     return pool[Math.floor(Math.random() * pool.length)];
   }
 
-  /**
-   * Pick among scored multiverse candidates. Strong candidates (mate, check, rescuing a piece)
-   * are played with the slider's probability; purposeless ones only rarely, for variety.
-   */
-  private _cpuPickMultiverseMove<T extends { score: number; bias: number }>(candidates: T[], chance: number): T | null {
-    if (candidates.length === 0) return null;
-    candidates.sort((a, b) => b.score - a.score || b.bias - a.bias);
-    const best = candidates[0];
-    if (best.score >= 1000) return best; // forced win on another board: always take it
-    const strength = Math.min(1, Math.max(0, best.score) / 4);
-    const probability = chance * (0.08 + 0.92 * strength) * (0.5 + best.bias);
-    if (Math.random() >= probability) return null;
-    // Choose randomly among equally good candidates to avoid repetitive play
-    const top = candidates.filter((c) => c.score === best.score);
-    return top[Math.floor(Math.random() * top.length)];
-  }
-
   /** Check if CPU has a worthwhile time travel move on this timeline */
   private _cpuCheckTimeTravel(tlId: number): TimeTravelTarget & { sourceSquare: Square; piece: Piece } | null {
     const tl = this.timelines[tlId];
@@ -2821,7 +2764,7 @@ timelines - list timelines`,
       }
     }
 
-    const pick = this._cpuPickMultiverseMove(candidates, this.cpuTimeTravelChance);
+    const pick = pickMultiverseMove(candidates, this.cpuTimeTravelChance);
     return pick ? { ...pick.target, sourceSquare: pick.sourceSquare, piece: pick.piece } : null;
   }
 
@@ -2832,7 +2775,7 @@ timelines - list timelines`,
     const color = tl.chess.turn();
     const biases = color === 'w' ? this.cpuWhitePortalBias : this.cpuBlackPortalBias;
     const sourceFen = tl.chess.fen();
-    const sourceEval = this._evaluateMaterialBalance(tl.chess, color);
+    const sourceEval = materialBalance(sourceFen, color);
     const candidates: Array<{ targetTimelineId: number; sourceSquare: Square; targetSquare: Square; piece: Piece; score: number; bias: number }> = [];
 
     for (const [square, piece] of pieceMap(sourceFen)) {
@@ -2845,39 +2788,13 @@ timelines - list timelines`,
         if (!plan.ok) continue;
         let score = scoreMultiverseMove(sourceFen, square, plan.targetFen, target.targetSquare, piece);
         // Reinforce a board where we're behind using material from one where we're ahead
-        const targetEval = this._evaluateMaterialBalance(targetTl.chess, color);
+        const targetEval = materialBalance(targetTl.chess.fen(), color);
         if (sourceEval - targetEval >= 3 && score >= 0) score += 2;
         candidates.push({ targetTimelineId: target.targetTimelineId, sourceSquare: square, targetSquare: target.targetSquare, piece, score, bias });
       }
     }
 
-    return this._cpuPickMultiverseMove(candidates, this.cpuCrossTimelineChance);
-  }
-
-  /** Evaluate material balance for a position (positive = color is winning) */
-  private _evaluateMaterialBalance(chess: ChessInstance, color: PieceColor): number {
-    const board = chess.board();
-    const pieceValues: Record<string, number> = { p: 1, n: 3, b: 3, r: 5, q: 9, k: 0 };
-
-    let whiteScore = 0;
-    let blackScore = 0;
-
-    for (let r = 0; r < 8; r++) {
-      for (let c = 0; c < 8; c++) {
-        const piece = board[r][c];
-        if (piece) {
-          const value = pieceValues[piece.type] || 0;
-          if (piece.color === 'w') {
-            whiteScore += value;
-          } else {
-            blackScore += value;
-          }
-        }
-      }
-    }
-
-    // Return score relative to the specified color
-    return color === 'w' ? whiteScore - blackScore : blackScore - whiteScore;
+    return pickMultiverseMove(candidates, this.cpuCrossTimelineChance);
   }
 
   /** Update CPU UI elements */
