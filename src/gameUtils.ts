@@ -3,7 +3,7 @@
  * Provides helper functions for FEN manipulation, validation, and logging
  */
 
-import type { Board, Piece, PieceType, Square, TimelineData, AnySnapshot, Snapshot } from './types';
+import type { Piece, Square, TimelineData } from './types';
 
 // ===============================================================
 // FEN Utilities

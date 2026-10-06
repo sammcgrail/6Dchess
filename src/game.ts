@@ -1,20 +1,9 @@
 /* 6D Chess - multiverse game controller with timeline branching */
 
-import { Board3D, TimelineCol } from './board3d';
+import { Board3D } from './board3d';
 import {
-  expandFenRow,
-  compressFenRow,
-  squareToIndices,
-  parseFen,
-  buildFen,
-  updateCastlingForRemoval,
-  updateCastlingForPlacement,
-  modifyFen as modifyFenUtil,
   getTimelineDebugInfo,
   logGameState,
-  isValidFen,
-  validateKings,
-  validateNoSelfCheck,
   type BoardDebugInfo,
   type GameDebugState,
 } from './gameUtils';
@@ -31,15 +20,20 @@ import type {
   Snapshot,
   PendingPromotion,
   SquareClickInfo,
-  CrossTimelineMove,
   CrossTimelineMoveTarget,
   CrossTimelineSelection,
   TimeTravelTarget,
   TimeTravelSelection,
   Square,
 } from './types';
-import { TimelineTransaction } from './transaction';
-import { stockfish, type StockfishMove } from './stockfish';
+import {
+  canCrossTimelines,
+  canTimeTravel,
+  crossTimelineLandingSquares,
+  planCrossTimelineMove,
+  planTimeTravel,
+} from './rules';
+import { stockfish } from './stockfish';
 
 class GameManager {
   private timelines: Record<number, TimelineData> = {};
@@ -58,12 +52,8 @@ class GameManager {
 
   // Cached state for optimized re-renders (avoid unnecessary DOM updates)
   private _lastMoveListHtml = '';
-  private _lastTimelineListHtml = '';
   private _lastTimelineStructure = '';
 
-  // Debounce timer for timeline hover highlighting
-  private _highlightDebounceTimer: number | null = null;
-  private _highlightDebounceDelay = 50; // ms
 
   init(): void {
     Board3D.init('scene-container', (info) => this.handleClick(info));
@@ -652,7 +642,6 @@ class GameManager {
         const item = target.closest('.tl-item:not(.empty)') as HTMLElement | null;
         if (item && item.dataset.tlId !== undefined) {
           const tlId = parseInt(item.dataset.tlId);
-          console.log('[TIMELINE_CLICK_DELEGATED] Clicked timeline', tlId, 'current active:', this.activeTimelineId);
           this.setActiveTimeline(tlId);
         }
       });
@@ -771,8 +760,7 @@ timelines - list timelines`,
         this.timeTravelSelection.sourceTimelineId,
         this.timeTravelSelection.sourceSquare,
         target.targetTurnIndex,
-        this.timeTravelSelection.piece,
-        target.isCapture ? target.capturedPiece : null
+        this.timeTravelSelection.piece
       );
       return { success: true, message: `Time traveled to turn ${turnIdx}` };
     }
@@ -949,32 +937,6 @@ timelines - list timelines`,
       chess = new Chess();
     }
 
-    // Validate we have a valid board
-    const board = chess.board();
-    let pieceCount = 0;
-    for (let r = 0; r < 8; r++) {
-      for (let c = 0; c < 8; c++) {
-        if (board[r] && board[r][c]) pieceCount++;
-      }
-    }
-    // TURN DEBUG: Log timeline creation with turn state
-    const fen = chess.fen();
-    const turnFromFen = fen.split(' ')[1];
-    console.log('[TURN_DEBUG] _createTimeline:', {
-      timelineId: id,
-      parentId,
-      branchTurn,
-      fen,
-      turnFromFen,
-      turnFromChess: chess.turn(),
-      pieceCount,
-      xOffset,
-    });
-    console.log('[_createTimeline] Created timeline', id, 'with', pieceCount, 'pieces', {
-      fen: chess.fen(),
-      xOffset,
-    });
-
     const tlData: TimelineData = {
       id,
       chess,
@@ -1008,21 +970,6 @@ timelines - list timelines`,
 
   setActiveTimeline(id: number, autoFocus: boolean = true): void {
     const previousId = this.activeTimelineId;
-    const prevTl = this.timelines[previousId];
-    const newTl = this.timelines[id];
-
-    // TURN DEBUG: Log timeline switch
-    console.log('[TURN_DEBUG] setActiveTimeline:', {
-      previousTimelineId: previousId,
-      previousTimelineName: prevTl?.name,
-      previousTurn: prevTl?.chess.turn(),
-      previousFen: prevTl?.chess.fen(),
-      newTimelineId: id,
-      newTimelineName: newTl?.name,
-      newTurn: newTl?.chess.turn(),
-      newFen: newTl?.chess.fen(),
-    });
-
     this.activeTimelineId = id;
     this.viewingMoveIndex = null; // Reset to current position when switching timelines
     Board3D.setActiveTimeline(id);
@@ -1045,17 +992,14 @@ timelines - list timelines`,
   handleClick(info: SquareClickInfo): void {
     const tlId = info.timelineId;
 
-    // If CPU move is pending, only allow camera focus (no piece interaction)
-    // This allows user to navigate to see different boards while CPU plays
-    if (this.cpuPendingMove) {
-      console.log('[handleClick] CPU move pending - allowing camera focus only');
-      // Allow focusing on clicked timeline even during CPU play
+    // While the CPU is mid-move, only allow camera focus (no piece interaction)
+    if (this.cpuEnabled && this.cpuMoveInProgress) {
       if (tlId !== this.activeTimelineId) {
         this.setActiveTimeline(tlId);
       } else {
         Board3D.focusTimeline(tlId, true);
       }
-      return; // Don't process piece selection/movement
+      return;
     }
 
     const sq = info.square;
@@ -1073,18 +1017,14 @@ timelines - list timelines`,
           this.timeTravelSelection.sourceTimelineId,
           this.timeTravelSelection.sourceSquare,
           target.targetTurnIndex,
-          this.timeTravelSelection.piece,
-          target.isCapture ? target.capturedPiece : null
+          this.timeTravelSelection.piece
         );
         return;
       }
     }
 
-    // Clicking on a history board without valid time travel target -> do nothing
-    if (isHistory) {
-      this._handleHistoryClick(tlId, turn, sq);
-      return;
-    }
+    // History boards are read-only unless clicking a time travel target
+    if (isHistory) return;
 
     // Check for cross-timeline move first
     if (this.crossTimelineSelection && tlId !== this.crossTimelineSelection.sourceTimelineId) {
@@ -1130,19 +1070,6 @@ timelines - list timelines`,
     const col = Board3D.getTimeline(tlId);
     if (!col) return;
 
-    // TURN DEBUG: Log click context
-    console.log('[TURN_DEBUG] _handleBoardClick:', {
-      timelineId: tlId,
-      timelineName: tl.name,
-      activeTimelineId: this.activeTimelineId,
-      clickedSquare: sq,
-      pieceAtSquare: piece ? { type: piece.type, color: piece.color } : null,
-      chessTurn: chess.turn(),
-      fen: chess.fen(),
-      currentSelection: this.selected,
-      selectedTimelineId: this.selectedTimelineId,
-    });
-
     if (this.selected && this.selectedTimelineId === tlId) {
       // Try to make a move
       const moves = chess.moves({ square: this.selected, verbose: true }) as ChessMove[];
@@ -1155,17 +1082,6 @@ timelines - list timelines`,
       }
 
       if (targetMove) {
-        // TURN DEBUG: Log before attempting move
-        const selectedPiece = chess.get(this.selected);
-        console.log('[TURN_DEBUG] About to make move:', {
-          timelineId: tlId,
-          timelineName: tl.name,
-          from: this.selected,
-          to: sq,
-          selectedPiece: selectedPiece ? { type: selectedPiece.type, color: selectedPiece.color } : null,
-          chessTurn: chess.turn(),
-          turnMismatch: selectedPiece && selectedPiece.color !== chess.turn(),
-        });
         this.makeMove(tlId, targetMove);
         return;
       }
@@ -1176,15 +1092,7 @@ timelines - list timelines`,
       }
     }
 
-    if (piece && piece.color === chess.turn()) {
-      // TURN DEBUG: Log piece selection
-      console.log('[TURN_DEBUG] Selecting piece (color matches turn):', {
-        timelineId: tlId,
-        timelineName: tl.name,
-        square: sq,
-        piece: { type: piece.type, color: piece.color },
-        chessTurn: chess.turn(),
-      });
+    if (piece && piece.color === chess.turn() && !this._isCpuControlled(piece.color)) {
       this.clearSelection();
       this.selected = sq;
       this.selectedTimelineId = tlId;
@@ -1220,174 +1128,14 @@ timelines - list timelines`,
         }
       }
     } else {
-      // TURN DEBUG: Log when piece selection is rejected (wrong color or empty square)
-      if (piece) {
-        console.log('[TURN_DEBUG] Selection REJECTED - wrong color:', {
-          timelineId: tlId,
-          timelineName: tl.name,
-          square: sq,
-          pieceColor: piece.color,
-          chessTurn: chess.turn(),
-          fen: chess.fen(),
-          reason: `Piece is ${piece.color === 'w' ? 'white' : 'black'} but it's ${chess.turn() === 'w' ? 'white' : 'black'}'s turn`,
-        });
-      }
       this.clearSelection();
     }
   }
 
-  private _handleHistoryClick(tlId: number, turnIndex: number, sq: string): void {
-    // History boards are read-only views
-    // Timeline forking only happens via queen time travel moves
-    // (clicking a time travel portal target, not directly clicking history)
-    return;
-  }
-
-  private _forkTimeline(parentTlId: number, snapshotIdx: number, selectedSq: string): void {
-    const parentTl = this.timelines[parentTlId];
-    const snapshot = parentTl.snapshots[snapshotIdx];
-
-    // Get FEN from snapshot if available (new format), otherwise replay moves
-    let fen = this._getSnapshotFen(snapshot);
-    if (!fen) {
-      // Fallback: Rebuild the FEN by replaying moves (for old snapshots without FEN)
-      const forkChess = new Chess();
-      for (let i = 0; i < snapshotIdx; i++) {
-        if (i < parentTl.moveHistory.length) {
-          const histMove = parentTl.moveHistory[i];
-          const moveObj: { from: string; to: string; promotion?: PieceType } = {
-            from: histMove.from,
-            to: histMove.to,
-          };
-          // Use the actual promotion piece that was played
-          if (histMove.promotion) {
-            moveObj.promotion = histMove.promotion;
-          }
-          forkChess.move(moveObj);
-        }
-      }
-      fen = forkChess.fen();
-    }
-
-    const newId = this.nextTimelineId++;
-
-    // Calculate x offset: alternate left/right of parent
-    // Use sibling count (children of same parent) instead of total timeline count
-    // to prevent exponential spacing growth
-    const siblingCount = Object.values(this.timelines)
-      .filter(tl => tl.parentId === parentTlId).length;
-    const side = siblingCount % 2 === 0 ? 1 : -1;
-    let xOffset = parentTl.xOffset + side * Board3D.TIMELINE_SPACING * Math.ceil((siblingCount + 1) / 2);
-
-    // OVERLAP DETECTION: Check if any existing timeline has this xOffset
-    const existingOffsets = Object.values(this.timelines).map(tl => tl.xOffset);
-    if (existingOffsets.includes(xOffset)) {
-      console.error('[BOARD_OVERLAP_BUG] Timeline xOffset collision detected!', {
-        newTimelineId: newId,
-        calculatedXOffset: xOffset,
-        parentId: parentTlId,
-        siblingCount,
-        side,
-        existingOffsets,
-        allTimelines: Object.values(this.timelines).map(tl => ({
-          id: tl.id,
-          xOffset: tl.xOffset,
-          parentId: tl.parentId,
-        })),
-      });
-      // FIX: Find a unique position by incrementing until we find an unused slot
-      const spacing = Board3D.TIMELINE_SPACING;
-      let attempts = 0;
-      while (existingOffsets.includes(xOffset) && attempts < 100) {
-        // Try alternating left/right with increasing distance
-        attempts++;
-        const distance = Math.ceil(attempts / 2) * spacing;
-        xOffset = parentTl.xOffset + (attempts % 2 === 0 ? 1 : -1) * distance;
-      }
-      console.log('[BOARD_OVERLAP_FIX] Found unique xOffset after collision:', {
-        newTimelineId: newId,
-        finalXOffset: xOffset,
-        attempts,
-      });
-    }
-
-    // DEBUG: Log all timeline positions for visibility
-    console.log('[TIMELINE_POSITIONS] Creating timeline with position:', {
-      newTimelineId: newId,
-      xOffset,
-      parentId: parentTlId,
-      siblingCount,
-      side,
-      allPositions: Object.values(this.timelines).map(tl => ({
-        id: tl.id,
-        xOffset: tl.xOffset,
-        name: tl.name,
-      })),
-    });
-
-    const newTl = this._createTimeline(newId, xOffset, parentTlId, snapshotIdx, fen);
-
-    // Copy snapshots up to the fork point
-    newTl.snapshots = [];
-    for (let s = 0; s <= snapshotIdx; s++) {
-      newTl.snapshots.push(this._deepCloneSnapshot(parentTl.snapshots[s]));
-    }
-
-    // Replay the corresponding move history up to fork point
-    // (snapshots has snapshotIdx+1 entries, so moveHistory needs snapshotIdx entries)
-    newTl.moveHistory = [];
-    for (let m = 0; m < snapshotIdx; m++) {
-      if (m < parentTl.moveHistory.length) {
-        newTl.moveHistory.push(JSON.parse(JSON.stringify(parentTl.moveHistory[m])));
-      }
-    }
-
-    // Validate snapshot consistency on the new timeline
-    this._validateSnapshotConsistency(newTl);
-
-    // Add snapshots as history layers on the new timeline visual
-    // (skip index 0 = initial state, add pairs as before-move states)
-    const newCol = Board3D.getTimeline(newId);
-    if (newCol) {
-      for (let h = newTl.moveHistory.length - 1; h >= 0; h--) {
-        const mv = newTl.moveHistory[h];
-        const boardBefore = this._getSnapshotBoard(newTl.snapshots[h]);
-        newCol.addSnapshot(boardBefore, mv.from, mv.to, mv.isWhite);
-      }
-    }
-
-    // Add branch connection line
-    Board3D.addBranchLine(
-      parentTlId,
-      Math.max(0, parentTl.moveHistory.length - snapshotIdx - 1),
-      newId
-    );
-
-    // Switch to the new timeline (respect camera follow setting for CPU mode)
-    const shouldFocus = !this.cpuEnabled || this.cpuCameraFollow;
-    this.setActiveTimeline(newId, shouldFocus);
-    this.renderTimeline(newId);
-
-    // Auto-select the piece on the new timeline
-    this.selected = selectedSq;
-    this.selectedTimelineId = newId;
-    const col = Board3D.getTimeline(newId);
-    if (col) {
-      const legalMoves = newTl.chess.moves({ square: selectedSq, verbose: true }) as ChessMove[];
-      col.select(selectedSq);
-      col.showLegalMoves(legalMoves, newTl.chess.board());
-    }
-
-    this.updateTimelineList();
-
-    // Setup collapsible shortcuts panel
-    this._setupCollapsibleShortcuts();
-  }
-
   /* -- Move execution -- */
-  makeMove(tlId: number, move: ChessMove, promotionPiece?: PieceType): void {
+  makeMove(tlId: number, move: ChessMove, promotionPiece?: PieceType): boolean {
     const tl = this.timelines[tlId];
-    if (!tl) return;
+    if (!tl) return false;
 
     // Clear history viewing mode when a move is made - ensures render uses current state
     if (this.viewingMoveIndex !== null && tlId === this.activeTimelineId) {
@@ -1396,79 +1144,25 @@ timelines - list timelines`,
 
     const chess = tl.chess;
     const isWhite = chess.turn() === 'w';
+    const isPromotion = !!move.flags && move.flags.indexOf('p') !== -1;
 
-    // TURN DEBUG: Log FEN and turn state BEFORE the move
-    const fenBefore = chess.fen();
-    const turnFromFenBefore = fenBefore.split(' ')[1]; // 'w' or 'b'
-    const pieceBeingMoved = chess.get(move.from);
-    const pieceColor = pieceBeingMoved?.color || 'unknown';
-
-    console.log('[TURN_DEBUG] makeMove ENTRY:', {
-      timelineId: tlId,
-      timelineName: tl.name,
-      fenBefore,
-      turnFromFen: turnFromFenBefore,
-      turnFromChess: chess.turn(),
-      pieceColor,
-      pieceType: pieceBeingMoved?.type || 'none',
-      moveFrom: move.from,
-      moveTo: move.to,
-      moveSan: move.san,
-      moveHistoryLength: tl.moveHistory.length,
-      snapshotsLength: tl.snapshots.length,
-    });
-
-    // TURN DEBUG: Flag mismatch between turn and piece color
-    if (pieceBeingMoved && pieceColor !== chess.turn()) {
-      console.error('[TURN_DEBUG] MISMATCH! Piece color does not match whose turn it is:', {
-        timelineId: tlId,
-        timelineName: tl.name,
-        expectedTurn: chess.turn(),
-        actualPieceColor: pieceColor,
-        fen: fenBefore,
-        move: `${move.from}-${move.to}`,
-      });
-    }
-
-    // Check if this is a pawn promotion move that needs user input
-    if (move.flags && move.flags.indexOf('p') !== -1 && !promotionPiece) {
-      // Show promotion picker and wait for user choice
+    // Pawn promotion needs a piece choice from the user
+    if (isPromotion && !promotionPiece) {
       this.pendingPromotion = { tlId, move };
       this._showPromotionPicker(tlId, move.to, isWhite);
-      return;
+      return false;
     }
 
     const boardBefore = this._cloneBoard(chess);
-
-    // Use the provided promotion piece, or default to queen for non-promotion moves
-    const moveObj: { from: string; to: string; promotion?: PieceType } = {
-      from: move.from,
-      to: move.to,
-    };
-    if (move.flags && move.flags.indexOf('p') !== -1) {
-      moveObj.promotion = promotionPiece || 'q';
-    }
+    const moveObj: { from: string; to: string; promotion?: PieceType } = { from: move.from, to: move.to };
+    if (isPromotion) moveObj.promotion = promotionPiece || 'q';
 
     const result = chess.move(moveObj);
     if (!result) {
       console.error('Invalid move:', moveObj);
-      return;
+      return false;
     }
 
-    // TURN DEBUG: Log FEN and turn state AFTER the move
-    const fenAfter = chess.fen();
-    const turnFromFenAfter = fenAfter.split(' ')[1];
-    console.log('[TURN_DEBUG] makeMove AFTER chess.move():', {
-      timelineId: tlId,
-      timelineName: tl.name,
-      fenAfter,
-      turnFromFenAfter,
-      turnFromChess: chess.turn(),
-      resultSan: result.san,
-      capturedPiece: result.captured || 'none',
-    });
-
-    // Store the actual promotion piece used (if any)
     // Use result.captured (actual move result) instead of move.captured (potential move)
     tl.moveHistory.push({
       from: move.from as Move['from'],
@@ -1479,10 +1173,7 @@ timelines - list timelines`,
       isWhite,
       promotion: result.promotion || null,
     });
-
     tl.snapshots.push(this._cloneBoard(chess));
-
-    // Validate snapshot/moveHistory consistency
     this._validateSnapshotConsistency(tl);
 
     const col = Board3D.getTimeline(tlId);
@@ -1491,32 +1182,16 @@ timelines - list timelines`,
       col.addMoveLine(move.from, move.to, isWhite);
       col.showLastMove(move.from, move.to);
     }
-
-    // Notify that snapshot was added - triggers branch line rebuild
     Board3D.notifySnapshotAdded(tlId);
 
-    // Spawn capture effect if this was a capture
     if (result.captured) {
       Board3D.spawnCaptureEffect(tlId, move.to);
     }
 
-    console.log('[makeMove] VISUAL_TRAILS_DEBUG: About to render after move', {
-      timestamp: Date.now(),
-      timelineId: tlId,
-      move: move.san || `${move.from}-${move.to}`,
-    });
     this.clearSelection();
     this.renderTimeline(tlId);
-    console.log('[makeMove] VISUAL_TRAILS_DEBUG: Render complete', {
-      timestamp: Date.now(),
-    });
-    this.updateStatus();
-    this.updateMoveList();
-    this.updateTimelineList();
-
-    // Setup collapsible shortcuts panel
-    this._setupCollapsibleShortcuts();
-    this._updateMoveSlider();
+    this._afterMove();
+    return true;
   }
 
   /* -- Cross-Timeline Movement -- */
@@ -1539,60 +1214,29 @@ timelines - list timelines`,
     square: Square,
     piece: Piece
   ): CrossTimelineMoveTarget[] {
-    if (!this.canMoveCrossTimeline(piece.type)) {
-      return [];
-    }
-
+    if (!canCrossTimelines(piece.type)) return [];
     const sourceTl = this.timelines[sourceTimelineId];
     if (!sourceTl) return [];
 
-    const sourceMoveCount = sourceTl.moveHistory.length;
-    const sourceColor = piece.color;
+    const sourceFen = sourceTl.chess.fen();
     const targets: CrossTimelineMoveTarget[] = [];
 
-    // Check all other timelines
-    for (const tlIdStr in this.timelines) {
-      const tlId = parseInt(tlIdStr);
-      if (tlId === sourceTimelineId) continue;
-
-      const targetTl = this.timelines[tlId];
-      if (!targetTl) continue;
-
-      // Rule: Cannot move to a finished timeline (checkmate/stalemate/draw)
+    for (const targetTl of Object.values(this.timelines)) {
+      if (targetTl.id === sourceTimelineId) continue;
+      // Cannot move to a finished timeline (checkmate/stalemate/draw)
       if (this.isTimelineFinished(targetTl)) continue;
+      // Cross-timeline moves count on both boards, so they must be in sync
+      if (targetTl.moveHistory.length !== sourceTl.moveHistory.length) continue;
 
-      // Rule: Can only move to timeline where it's your turn
-      if (targetTl.chess.turn() !== sourceColor) continue;
-
-      // Rule: Cross-timeline move counts in both timelines,
-      // so both must be at same move count (synced)
-      if (targetTl.moveHistory.length !== sourceMoveCount) continue;
-
-      // NEW RULE: Piece can only land on squares it could legally reach on the target board
-      // Calculate legal landing squares by simulating the piece at its source square on the target board
-      const legalLandingSquares = this._getLegalCrossTimelineLandingSquares(
-        targetTl.chess,
-        square,
-        piece,
-        sourceColor
-      );
-
-      // Add each legal landing square as a target
-      for (const targetSquare of legalLandingSquares) {
-        const targetPiece = targetTl.chess.get(targetSquare);
-
-        // Can't move if own piece is there
-        if (targetPiece && targetPiece.color === sourceColor) continue;
-
-        // CANNOT capture kings - that would break the game
-        if (targetPiece && targetPiece.type === 'k') continue;
-
-        // Valid target!
+      const targetFen = targetTl.chess.fen();
+      for (const targetSquare of crossTimelineLandingSquares(targetFen, square, piece)) {
+        const plan = planCrossTimelineMove(sourceFen, targetFen, square, targetSquare, piece);
+        if (!plan.ok) continue;
         targets.push({
-          targetTimelineId: tlId,
-          targetSquare: targetSquare as Square,
-          isCapture: targetPiece !== null,
-          capturedPiece: targetPiece,
+          targetTimelineId: targetTl.id,
+          targetSquare,
+          isCapture: false,
+          capturedPiece: null,
         });
       }
     }
@@ -1600,148 +1244,13 @@ timelines - list timelines`,
     return targets;
   }
 
-  /**
-   * Calculate legal landing squares for a cross-timeline move.
-   * The piece arrives at its source square position on the target board,
-   * then can move to any square it could legally reach from there.
-   * Cannot capture immediately upon arrival (landing move is non-capturing).
-   */
-  private _getLegalCrossTimelineLandingSquares(
-    targetChess: ChessInstance,
-    sourceSquare: Square,
-    piece: Piece,
-    color: 'w' | 'b'
-  ): string[] {
-    const landingSquares: string[] = [];
-
-    // The piece appears at the source square position on the target board
-    // It can then move to any square reachable by that piece type from that position
-    // NOTE: We use piece movement patterns, not chess.js moves() because:
-    // 1. The piece doesn't exist on the target board yet
-    // 2. We need to consider where it COULD move if it were there
-
-    const file = sourceSquare.charCodeAt(0) - 97; // 0-7 (a-h)
-    const rank = parseInt(sourceSquare[1]) - 1;   // 0-7 (1-8)
-
-    // Get all squares this piece type can reach from the source square
-    const reachableSquares = this._getPieceReachableSquares(piece.type, file, rank, color, targetChess);
-
-    for (const sq of reachableSquares) {
-      const targetPiece = targetChess.get(sq as Square);
-
-      // Cross-timeline landing cannot capture (piece just "phases in")
-      // Only non-capture landings are valid
-      if (targetPiece === null) {
-        landingSquares.push(sq);
-      }
-    }
-
-    return landingSquares;
-  }
-
-  /**
-   * Get all squares a piece type can reach from a given position.
-   * This calculates pure movement patterns without considering check.
-   */
-  private _getPieceReachableSquares(
-    pieceType: PieceType,
-    file: number,
-    rank: number,
-    color: 'w' | 'b',
-    chess: ChessInstance
-  ): string[] {
-    const squares: string[] = [];
-
-    const addSquare = (f: number, r: number) => {
-      if (f >= 0 && f < 8 && r >= 0 && r < 8) {
-        squares.push(String.fromCharCode(97 + f) + (r + 1));
-      }
-    };
-
-    const addRaySquares = (df: number, dr: number) => {
-      let f = file + df;
-      let r = rank + dr;
-      while (f >= 0 && f < 8 && r >= 0 && r < 8) {
-        const sq = String.fromCharCode(97 + f) + (r + 1);
-        const piece = chess.get(sq as Square);
-        if (piece) {
-          // Can't pass through pieces (but we add it in case it's capturable - filtered later)
-          squares.push(sq);
-          break;
-        }
-        squares.push(sq);
-        f += df;
-        r += dr;
-      }
-    };
-
-    switch (pieceType) {
-      case 'p': // Pawn - only forward move (no captures for cross-timeline landing)
-        const dir = color === 'w' ? 1 : -1;
-        const startRank = color === 'w' ? 1 : 6;
-        // Single push
-        addSquare(file, rank + dir);
-        // Double push from starting rank
-        if (rank === startRank) {
-          addSquare(file, rank + 2 * dir);
-        }
-        break;
-
-      case 'n': // Knight
-        const knightMoves = [
-          [-2, -1], [-2, 1], [-1, -2], [-1, 2],
-          [1, -2], [1, 2], [2, -1], [2, 1]
-        ];
-        for (const [df, dr] of knightMoves) {
-          addSquare(file + df, rank + dr);
-        }
-        break;
-
-      case 'b': // Bishop - diagonal rays
-        addRaySquares(-1, -1);
-        addRaySquares(-1, 1);
-        addRaySquares(1, -1);
-        addRaySquares(1, 1);
-        break;
-
-      case 'r': // Rook - straight rays
-        addRaySquares(-1, 0);
-        addRaySquares(1, 0);
-        addRaySquares(0, -1);
-        addRaySquares(0, 1);
-        break;
-
-      case 'q': // Queen - all rays
-        addRaySquares(-1, -1);
-        addRaySquares(-1, 1);
-        addRaySquares(1, -1);
-        addRaySquares(1, 1);
-        addRaySquares(-1, 0);
-        addRaySquares(1, 0);
-        addRaySquares(0, -1);
-        addRaySquares(0, 1);
-        break;
-
-      case 'k': // King - one square any direction (though kings can't cross timelines)
-        for (let df = -1; df <= 1; df++) {
-          for (let dr = -1; dr <= 1; dr++) {
-            if (df !== 0 || dr !== 0) {
-              addSquare(file + df, rank + dr);
-            }
-          }
-        }
-        break;
-    }
-
-    return squares;
-  }
-
-  /** Execute a cross-timeline move
+  /** Execute a cross-timeline move. Validates fully before changing any state.
    * @param sourceTimelineId - Timeline the piece is leaving
    * @param targetTimelineId - Timeline the piece is arriving in
    * @param sourceSquare - Where the piece is on the source board
-   * @param targetSquare - Where the piece lands on the target board (can be different from source)
+   * @param targetSquare - Where the piece lands on the target board
    * @param piece - The piece being moved
+   * @returns true if the move was made
    */
   private makeCrossTimelineMove(
     sourceTimelineId: number,
@@ -1749,242 +1258,68 @@ timelines - list timelines`,
     sourceSquare: Square,
     targetSquare: Square,
     piece: Piece
-  ): void {
+  ): boolean {
     const sourceTl = this.timelines[sourceTimelineId];
     const targetTl = this.timelines[targetTimelineId];
-    if (!sourceTl || !targetTl) return;
+    if (!sourceTl || !targetTl || sourceTl === targetTl) return false;
+    if (this.isTimelineFinished(targetTl)) return false;
+    if (sourceTl.moveHistory.length !== targetTl.moveHistory.length) return false;
 
-    // SAFETY CHECK: Cannot move to a finished timeline
-    if (this.isTimelineFinished(targetTl)) {
-      console.error('[Cross-Timeline] Target timeline is finished (checkmate/stalemate/draw), blocking move', {
-        targetTimelineId,
-        inCheckmate: targetTl.chess.in_checkmate(),
-        inStalemate: targetTl.chess.in_stalemate(),
-        inDraw: targetTl.chess.in_draw(),
-      });
-      return;
-    }
-
-    // RACE CONDITION CHECK: Re-validate move count synchronization
-    // Cross-timeline moves require both timelines to have the same move count
-    if (sourceTl.moveHistory.length !== targetTl.moveHistory.length) {
-      console.error('[Cross-Timeline] RACE CONDITION DETECTED: Move count mismatch!', {
-        sourceTimelineId,
-        sourceMoves: sourceTl.moveHistory.length,
-        targetTimelineId,
-        targetMoves: targetTl.moveHistory.length,
-      });
-      return;
-    }
-
-    // RACE CONDITION CHECK: Re-validate turn synchronization
-    // Both timelines must be on the same color's turn
-    if (sourceTl.chess.turn() !== targetTl.chess.turn()) {
-      console.error('[Cross-Timeline] RACE CONDITION DETECTED: Turn mismatch!', {
-        sourceTimelineId,
-        sourceTurn: sourceTl.chess.turn(),
-        targetTimelineId,
-        targetTurn: targetTl.chess.turn(),
-      });
-      return;
+    const plan = planCrossTimelineMove(sourceTl.chess.fen(), targetTl.chess.fen(), sourceSquare, targetSquare, piece);
+    if (!plan.ok) {
+      console.warn('[Cross-Timeline] Rejected move:', plan.reason);
+      return false;
     }
 
     const isWhite = piece.color === 'w';
-    const targetPiece = targetTl.chess.get(targetSquare);
-
-    // RACE CONDITION CHECK: Validate it's this piece's color's turn
-    if ((isWhite && sourceTl.chess.turn() !== 'w') || (!isWhite && sourceTl.chess.turn() !== 'b')) {
-      console.error('[Cross-Timeline] RACE CONDITION DETECTED: Not this color turn!', {
-        pieceColor: piece.color,
-        currentTurn: sourceTl.chess.turn(),
-      });
-      return;
-    }
-
-    // TURN DEBUG: Log cross-timeline move entry
-    console.log('[TURN_DEBUG] makeCrossTimelineMove ENTRY:', {
-      sourceTimelineId,
-      sourceTimelineName: sourceTl.name,
-      sourceFen: sourceTl.chess.fen(),
-      sourceTurn: sourceTl.chess.turn(),
-      targetTimelineId,
-      targetTimelineName: targetTl.name,
-      targetFen: targetTl.chess.fen(),
-      targetTurn: targetTl.chess.turn(),
-      sourceSquare,
-      targetSquare,
-      piece: { type: piece.type, color: piece.color },
-      pieceIsWhite: isWhite,
-      targetPiece: targetPiece ? { type: targetPiece.type, color: targetPiece.color } : null,
-    });
-
-    // Clone boards before move for snapshots
     const sourceBoardBefore = this._cloneBoard(sourceTl.chess);
     const targetBoardBefore = this._cloneBoard(targetTl.chess);
+    sourceTl.chess.load(plan.sourceFen);
+    targetTl.chess.load(plan.targetFen);
 
-    // 1. Remove piece from source timeline at sourceSquare
-    const sourceFen = sourceTl.chess.fen();
-
-    // Verify piece exists on source before removal
-    const sourcePieceCheck = sourceTl.chess.get(sourceSquare);
-    if (!sourcePieceCheck || sourcePieceCheck.type !== piece.type || sourcePieceCheck.color !== piece.color) {
-      console.error('[Cross-Timeline] Source piece mismatch!', {
-        expected: piece,
-        actual: sourcePieceCheck,
-        sourceSquare,
-      });
-      throw new Error(`Cross-timeline move failed: source piece mismatch at ${sourceSquare}`);
-    }
-
-    // Build new FEN without the piece
-    // Source: piece left, no capture on source timeline
-    // skipSelfCheckValidation=true because the piece is LEAVING (check validation happens on target)
-    const newSourceFen = this._modifyFen(sourceFen, sourceSquare, null, !isWhite, false, true);
-    const sourceLoadResult = sourceTl.chess.load(newSourceFen);
-    if (!sourceLoadResult) {
-      console.error('[Cross-Timeline] Failed to load source FEN after remove!', { fen: newSourceFen });
-      throw new Error(`Cross-timeline move failed: invalid source FEN after piece removal`);
-    }
-
-    // Validate remove worked - piece should no longer be there
-    const afterRemove = sourceTl.chess.get(sourceSquare);
-    if (afterRemove) {
-      console.error('[Cross-Timeline] Piece still present after removal!', {
-        sourceSquare,
-        stillThere: afterRemove,
-      });
-      throw new Error(`Cross-timeline move failed: piece still present at ${sourceSquare} after removal`);
-    }
-
-    // 2. Add piece to target timeline at targetSquare (capture if enemy piece there)
-    const targetFen = targetTl.chess.fen();
-    const isCrossCapture = targetPiece !== null;
-    const newTargetFen = this._modifyFen(targetFen, targetSquare, piece, !isWhite, isCrossCapture);
-    const targetLoadResult = targetTl.chess.load(newTargetFen);
-    if (!targetLoadResult) {
-      console.error('[Cross-Timeline] Failed to load target FEN after placement!', { fen: newTargetFen });
-      throw new Error(`Cross-timeline move failed: invalid target FEN after piece placement`);
-    }
-
-    // Validate placement worked - piece should now be there
-    const afterPlace = targetTl.chess.get(targetSquare);
-    if (!afterPlace || afterPlace.type !== piece.type || afterPlace.color !== piece.color) {
-      console.error('[Cross-Timeline] Piece placement verification failed!', {
-        expected: piece,
-        actual: afterPlace,
-        targetSquare,
-      });
-      throw new Error(`Cross-timeline move failed: piece not found at ${targetSquare} after placement`);
-    }
-
-    // 3. Record the move in both timelines
-    // Use actual piece character (not hardcoded Q) for future extensibility
+    // Record the move in both timelines
     const pieceChar = piece.type.toUpperCase();
-    // Show source and target squares if different, otherwise just the square
-    const moveNotation = sourceSquare === targetSquare
-      ? `${pieceChar}${sourceSquare}→T${targetTimelineId}`
-      : `${pieceChar}${sourceSquare}→${targetSquare}@T${targetTimelineId}`;
+    const promo = plan.placedPiece.type !== piece.type ? '=' + plan.placedPiece.type.toUpperCase() : '';
     const crossMove: Move = {
       from: sourceSquare,
       to: targetSquare,
       piece: piece.type,
-      captured: targetPiece?.type || null,
-      san: moveNotation,
+      captured: null,
+      san: '',
       isWhite,
+      promotion: promo ? plan.placedPiece.type : null,
     };
-
-    // Source timeline: piece left (show departure notation)
-    const sourceSan = sourceSquare === targetSquare
+    const departSan = sourceSquare === targetSquare
       ? `${pieceChar}${sourceSquare}→T${targetTimelineId}`
       : `${pieceChar}${sourceSquare}→${targetSquare}@T${targetTimelineId}`;
-    sourceTl.moveHistory.push({
-      ...crossMove,
-      san: sourceSan,
-    });
+    const arriveSan = sourceSquare === targetSquare
+      ? `${pieceChar}${targetSquare}${promo}←T${sourceTimelineId}`
+      : `${pieceChar}${sourceSquare}→${targetSquare}${promo}←T${sourceTimelineId}`;
+    sourceTl.moveHistory.push({ ...crossMove, san: departSan });
     sourceTl.snapshots.push(this._cloneBoard(sourceTl.chess));
-
-    // Target timeline: piece arrived (show arrival notation)
-    const targetSan = sourceSquare === targetSquare
-      ? `${pieceChar}${targetSquare}←T${sourceTimelineId}`
-      : `${pieceChar}${sourceSquare}→${targetSquare}←T${sourceTimelineId}`;
-    targetTl.moveHistory.push({
-      ...crossMove,
-      san: targetSan,
-    });
+    targetTl.moveHistory.push({ ...crossMove, san: arriveSan });
     targetTl.snapshots.push(this._cloneBoard(targetTl.chess));
 
-    // 4. Update 3D visualization
+    // Update 3D visualization
     const sourceCol = Board3D.getTimeline(sourceTimelineId);
     const targetCol = Board3D.getTimeline(targetTimelineId);
-
     if (sourceCol) {
-      // On source board, highlight where piece left from
       sourceCol.addSnapshot(this._getSnapshotBoard(sourceBoardBefore), sourceSquare, sourceSquare, isWhite);
       sourceCol.showLastMove(sourceSquare, sourceSquare);
     }
-
     if (targetCol) {
-      // On target board, highlight where piece arrived
       targetCol.addSnapshot(this._getSnapshotBoard(targetBoardBefore), targetSquare, targetSquare, isWhite);
       targetCol.showLastMove(targetSquare, targetSquare);
     }
-
-    // Draw line between timelines to show the move (use target square for the visual)
     Board3D.addCrossTimelineLine(sourceTimelineId, targetTimelineId, targetSquare, isWhite);
-
-    // Notify that snapshots were added - triggers branch line rebuild
     Board3D.notifySnapshotAdded(sourceTimelineId);
     Board3D.notifySnapshotAdded(targetTimelineId);
 
-    // Spawn capture effect on target timeline if capture occurred
-    if (targetPiece) {
-      Board3D.spawnCaptureEffect(targetTimelineId, targetSquare);
-    }
-
-    // TURN DEBUG: Log turn state after cross-timeline move completed
-    console.log('[TURN_DEBUG] makeCrossTimelineMove AFTER:', {
-      sourceTimelineId,
-      sourceTimelineName: sourceTl.name,
-      sourceFenAfter: sourceTl.chess.fen(),
-      sourceTurnAfter: sourceTl.chess.turn(),
-      targetTimelineId,
-      targetTimelineName: targetTl.name,
-      targetFenAfter: targetTl.chess.fen(),
-      targetTurnAfter: targetTl.chess.turn(),
-    });
-
-    // 5. Update UI
-    console.log('[crossTimeline] VISUAL_TRAILS_DEBUG: About to render after cross-timeline move', {
-      timestamp: Date.now(),
-      sourceTimelineId,
-      targetTimelineId,
-      sourceSquare,
-      targetSquare,
-    });
     this.clearSelection();
     this.renderTimeline(sourceTimelineId);
     this.renderTimeline(targetTimelineId);
-
-    // Validate no duplicate sprites after cross-timeline renders
-    // This catches edge cases where sprites weren't properly cleaned up
-    // Pass current board state so we can do a full rebuild if needed
-    if (sourceCol) {
-      sourceCol.validateNoDuplicates(sourceTl.chess.board());
-    }
-    if (targetCol) {
-      targetCol.validateNoDuplicates(targetTl.chess.board());
-    }
-
-    console.log('[crossTimeline] VISUAL_TRAILS_DEBUG: Render complete', {
-      timestamp: Date.now(),
-    });
-    this.updateStatus();
-    this.updateMoveList();
-    this.updateTimelineList();
-
-    // Setup collapsible shortcuts panel
-    this._setupCollapsibleShortcuts();
-    this._updateMoveSlider();
+    this._afterMove();
+    return true;
   }
 
   /* -- Time Travel Movement (backward in time) -- */
@@ -1995,493 +1330,148 @@ timelines - list timelines`,
     square: Square,
     piece: Piece
   ): TimeTravelTarget[] {
-    // Queens, Rooks, Bishops, and Knights can time travel
-    const canTimeTravel = ['q', 'r', 'b', 'n'].includes(piece.type);
-    if (!canTimeTravel) return [];
-
+    if (!canTimeTravel(piece.type)) return [];
     const tl = this.timelines[sourceTimelineId];
-    if (!tl) return [];
+    if (!tl || tl.snapshots.length < 2) return [];
 
-    // Need at least 2 snapshots (initial + at least 1 move) for time travel
-    if (tl.snapshots.length < 2) return [];
-
+    const sourceFen = tl.chess.fen();
     const targets: TimeTravelTarget[] = [];
-
-    // Queen can travel to any previous board state where:
-    // 1. The same square is empty OR occupied by enemy piece
-    // 2. The snapshot represents a past state (not the current board)
-    // We iterate snapshots from most recent to oldest (excluding current)
+    // Iterate past snapshots from most recent to oldest (excluding the current board)
     for (let snapshotIdx = tl.snapshots.length - 2; snapshotIdx >= 0; snapshotIdx--) {
-      const snapshot = tl.snapshots[snapshotIdx];
-      const board = this._getSnapshotBoard(snapshot);
-      const pos = this._fromSq(square);
-      const targetPiece = board[pos.r][pos.c];
-
-      // Can arrive if square is empty or has enemy piece (capture)
-      // CANNOT capture kings - that would break the game
-      if (!targetPiece || (targetPiece.color !== piece.color && targetPiece.type !== 'k')) {
-        // turnIndex is relative to history layers (0 = most recent history)
-        // Snapshot index 0 is initial state, snapshot length-1 is current
+      const snapshotFen = this._getSnapshotFen(tl.snapshots[snapshotIdx]);
+      if (!snapshotFen) continue;
+      const plan = planTimeTravel(sourceFen, snapshotFen, square, piece);
+      if (!plan.ok) continue;
+      targets.push({
+        sourceTimelineId,
         // History layer 0 = snapshot at (length - 2), layer 1 = snapshot at (length - 3), etc.
-        const turnIndex = tl.snapshots.length - 2 - snapshotIdx;
-        targets.push({
-          sourceTimelineId,
-          targetTurnIndex: turnIndex,
-          targetSquare: square,
-          isCapture: targetPiece !== null,
-          capturedPiece: targetPiece,
-        });
-      }
+        targetTurnIndex: tl.snapshots.length - 2 - snapshotIdx,
+        targetSquare: square,
+        isCapture: plan.captured !== null,
+        capturedPiece: plan.captured,
+      });
     }
-
     return targets;
   }
 
-  /** Execute a time travel move - piece goes back in time, creating a new timeline */
+  /** Pick an unused x position for a new child timeline, alternating sides of the parent */
+  private _nextChildXOffset(parentId: number): number {
+    const parent = this.timelines[parentId];
+    const spacing = Board3D.TIMELINE_SPACING;
+    const used = new Set(Object.values(this.timelines).map((tl) => tl.xOffset));
+    const siblingCount = Object.values(this.timelines).filter((tl) => tl.parentId === parentId).length;
+    const side = siblingCount % 2 === 0 ? 1 : -1;
+    let xOffset = parent.xOffset + side * spacing * Math.ceil((siblingCount + 1) / 2);
+    for (let attempt = 1; used.has(xOffset) && attempt < 200; attempt++) {
+      xOffset = parent.xOffset + (attempt % 2 === 0 ? 1 : -1) * Math.ceil(attempt / 2) * spacing;
+    }
+    return xOffset;
+  }
+
+  /** Execute a time travel move - piece goes back in time, creating a new timeline.
+   * Validates fully before changing any state. Returns true if the move was made. */
   private _makeTimeTravelMove(
     sourceTimelineId: number,
     sourceSquare: Square,
     targetTurnIndex: number,
-    piece: Piece,
-    capturedPiece: Piece | null | undefined
-  ): void {
+    piece: Piece
+  ): boolean {
     const sourceTl = this.timelines[sourceTimelineId];
-    if (!sourceTl) return;
+    if (!sourceTl) return false;
 
-    // RACE CONDITION CHECK: Validate it's this piece's color's turn
-    const isWhiteMoving = piece.color === 'w';
-    if ((isWhiteMoving && sourceTl.chess.turn() !== 'w') || (!isWhiteMoving && sourceTl.chess.turn() !== 'b')) {
-      console.error('[Time Travel] RACE CONDITION DETECTED: Not this color turn!', {
-        pieceColor: piece.color,
-        currentTurn: sourceTl.chess.turn(),
-        sourceTimelineId,
-      });
-      return;
-    }
+    const snapshotIdx = sourceTl.snapshots.length - 2 - targetTurnIndex;
+    const targetSnapshot = sourceTl.snapshots[snapshotIdx];
+    const snapshotFen = targetSnapshot ? this._getSnapshotFen(targetSnapshot) : null;
+    if (!snapshotFen) return false;
 
-    // TURN DEBUG: Log time travel move entry
-    console.log('[TURN_DEBUG] _makeTimeTravelMove ENTRY:', {
-      sourceTimelineId,
-      sourceTimelineName: sourceTl.name,
-      sourceFen: sourceTl.chess.fen(),
-      sourceTurn: sourceTl.chess.turn(),
-      sourceSquare,
-      targetTurnIndex,
-      piece: { type: piece.type, color: piece.color },
-      capturedPiece: capturedPiece ? { type: capturedPiece.type, color: capturedPiece.color } : null,
-    });
-
-    // VALIDATION: Verify the piece actually exists at the source square
-    const actualPiece = sourceTl.chess.get(sourceSquare);
-    if (!actualPiece) {
-      console.error('[Time Travel] ABORT: No piece at source square!', {
-        sourceSquare,
-        expectedPiece: piece,
-        actualBoard: sourceTl.chess.fen(),
-      });
-      return;
-    }
-    if (actualPiece.type !== piece.type || actualPiece.color !== piece.color) {
-      console.error('[Time Travel] ABORT: Piece mismatch at source!', {
-        sourceSquare,
-        expectedPiece: piece,
-        actualPiece,
-        fen: sourceTl.chess.fen(),
-      });
-      return;
+    const plan = planTimeTravel(sourceTl.chess.fen(), snapshotFen, sourceSquare, piece);
+    if (!plan.ok) {
+      console.warn('[Time Travel] Rejected move:', plan.reason);
+      return false;
     }
 
     const isWhite = piece.color === 'w';
-
-    // Convert turnIndex to snapshot index
-    // turnIndex 0 = snapshot at (length - 2), turnIndex 1 = snapshot at (length - 3), etc.
-    const snapshotIdx = sourceTl.snapshots.length - 2 - targetTurnIndex;
-    if (snapshotIdx < 0) return;
-
-    const targetSnapshot = sourceTl.snapshots[snapshotIdx];
-    if (!targetSnapshot) return;
-
-    // Get FEN at target historical point
-    let fen = this._getSnapshotFen(targetSnapshot);
-    console.log('[Time Travel] snapshotIdx:', snapshotIdx);
-    console.log('[Time Travel] targetSnapshot:', JSON.stringify(targetSnapshot).slice(0, 200));
-    console.log('[Time Travel] FEN from snapshot:', fen);
-
-    if (!fen) {
-      console.log('[Time Travel] No FEN in snapshot, rebuilding from moves...');
-      // Fallback: Rebuild FEN by replaying moves (for old snapshots)
-      const forkChess = new Chess();
-      for (let i = 0; i < snapshotIdx; i++) {
-        if (i < sourceTl.moveHistory.length) {
-          const histMove = sourceTl.moveHistory[i];
-          const moveResult = forkChess.move({ from: histMove.from, to: histMove.to, promotion: histMove.promotion || undefined });
-          if (!moveResult) {
-            console.error('[Time Travel] Failed to replay move:', histMove);
-          }
-        }
-      }
-      fen = forkChess.fen();
-      console.log('[Time Travel] Rebuilt FEN:', fen);
-    }
-
-    if (!fen) {
-      console.error('[Time Travel] Could not get FEN! Aborting time travel.');
-      return;
-    }
-
-    // Clone board before we modify source timeline
-    const sourceBoardBefore = this._cloneBoard(sourceTl.chess);
-
-    // 1. Remove piece from source timeline (it traveled away)
-    const sourceFen = sourceTl.chess.fen();
-    // Source: piece left via time travel, no capture on source timeline
-    // skipSelfCheckValidation=true because the piece is LEAVING (check validation happens on new timeline)
-    const newSourceFen = this._modifyFen(sourceFen, sourceSquare, null, !isWhite, false, true);
-    sourceTl.chess.load(newSourceFen);
-
-    // Record the departure move on source timeline
     const pieceChar = piece.type.toUpperCase();
+
+    // 1. Piece departs the source timeline
+    const sourceBoardBefore = this._cloneBoard(sourceTl.chess);
+    sourceTl.chess.load(plan.sourceFen);
     sourceTl.moveHistory.push({
       from: sourceSquare,
       to: sourceSquare,
       piece: piece.type,
       captured: null,
-      san: `${pieceChar}${sourceSquare}⟳T${targetTurnIndex}`,  // Time travel notation
+      san: `${pieceChar}${sourceSquare}⟳T${targetTurnIndex}`,
       isWhite,
     });
     sourceTl.snapshots.push(this._cloneBoard(sourceTl.chess));
 
-    // Update source timeline visual
     const sourceCol = Board3D.getTimeline(sourceTimelineId);
     if (sourceCol) {
       sourceCol.addSnapshot(this._getSnapshotBoard(sourceBoardBefore), sourceSquare, sourceSquare, isWhite);
       sourceCol.showLastMove(sourceSquare, sourceSquare);
-      // Immediately re-render to show piece removal (don't wait until end)
-      sourceCol.render(sourceTl.chess.board());
     }
-
-    // Notify that snapshot was added - triggers branch line rebuild
     Board3D.notifySnapshotAdded(sourceTimelineId);
-
-    // Spawn portal effect at departure point
     Board3D.spawnPortalEffect(sourceTimelineId, sourceSquare);
 
-    // 2. Create a NEW timeline branching from that historical point
+    // 2. A new timeline branches from the historical point with the piece arriving
     const newId = this.nextTimelineId++;
+    const xOffset = this._nextChildXOffset(sourceTimelineId);
+    const newTl = this._createTimeline(newId, xOffset, sourceTimelineId, snapshotIdx, plan.arrivalFen);
 
-    // Calculate x offset: alternate left/right of parent
-    // Use sibling count (children of same parent) instead of total timeline count
-    // to prevent exponential spacing growth
-    const siblingCount = Object.values(this.timelines)
-      .filter(tl => tl.parentId === sourceTimelineId).length;
-    const side = siblingCount % 2 === 0 ? 1 : -1;
-    let xOffset = sourceTl.xOffset + side * Board3D.TIMELINE_SPACING * Math.ceil((siblingCount + 1) / 2);
-
-    // OVERLAP DETECTION: Check if any existing timeline has this xOffset
-    const existingOffsets = Object.values(this.timelines).map(tl => tl.xOffset);
-    if (existingOffsets.includes(xOffset)) {
-      console.error('[BOARD_OVERLAP_BUG] Timeline xOffset collision detected (time travel)!', {
-        newTimelineId: newId,
-        calculatedXOffset: xOffset,
-        parentId: sourceTimelineId,
-        siblingCount,
-        side,
-        existingOffsets,
-        allTimelines: Object.values(this.timelines).map(tl => ({
-          id: tl.id,
-          xOffset: tl.xOffset,
-          parentId: tl.parentId,
-        })),
-      });
-      // FIX: Find a unique position by incrementing until we find an unused slot
-      const spacing = Board3D.TIMELINE_SPACING;
-      let attempts = 0;
-      while (existingOffsets.includes(xOffset) && attempts < 100) {
-        // Try alternating left/right with increasing distance
-        attempts++;
-        const distance = Math.ceil(attempts / 2) * spacing;
-        xOffset = sourceTl.xOffset + (attempts % 2 === 0 ? 1 : -1) * distance;
-      }
-      console.log('[BOARD_OVERLAP_FIX] Found unique xOffset after collision (time travel):', {
-        newTimelineId: newId,
-        finalXOffset: xOffset,
-        attempts,
-      });
-    }
-
-    // DEBUG: Log all timeline positions for visibility
-    console.log('[TIMELINE_POSITIONS] Creating timeline with position (time travel):', {
-      newTimelineId: newId,
-      xOffset,
-      parentId: sourceTimelineId,
-      siblingCount,
-      side,
-      allPositions: Object.values(this.timelines).map(tl => ({
-        id: tl.id,
-        xOffset: tl.xOffset,
-        name: tl.name,
-      })),
-    });
-
-    console.log('[Time Travel] Creating new timeline:', {
-      originalFen: fen,
-      sourceSquare,
-      piece,
-      snapshotIdx,
-    });
-
-    // Create the new timeline with the ORIGINAL historical FEN
-    // (We'll add the time-traveled piece manually to allow extra queens)
-    const newTl = this._createTimeline(newId, xOffset, sourceTimelineId, snapshotIdx, fen);
-
-    // Now manually place the time-traveled piece using chess.put()
-    // This bypasses validation that would reject multiple queens etc
-    const targetSquare = sourceSquare;  // Piece appears at same square, different time
-
-    // Remove any piece currently on target (capture)
-    const existingPiece = newTl.chess.get(targetSquare);
-    if (existingPiece) {
-      const removed = newTl.chess.remove(targetSquare);
-      if (!removed) {
-        console.error('[Time Travel] Failed to remove existing piece at', targetSquare, existingPiece);
-        throw new Error(`Time travel failed: could not remove existing piece at ${targetSquare}`);
-      }
-      console.log('[Time Travel] Removed existing piece:', { square: targetSquare, piece: existingPiece });
-    }
-
-    // Validate target square is now empty before placing
-    const afterRemove = newTl.chess.get(targetSquare);
-    if (afterRemove) {
-      console.error('[Time Travel] Square not empty after remove!', { square: targetSquare, stillThere: afterRemove });
-      throw new Error(`Time travel failed: square ${targetSquare} not empty after remove operation`);
-    }
-
-    // Place the time-traveled piece
-    const placed = newTl.chess.put(piece, targetSquare);
-    if (!placed) {
-      console.error('[Time Travel] Failed to place piece at', targetSquare, piece);
-      throw new Error(`Time travel failed: could not place ${piece.type} at ${targetSquare}`);
-    }
-
-    // Verify the piece was actually placed correctly (no overlaps)
-    const verifyPlaced = newTl.chess.get(targetSquare);
-    if (!verifyPlaced || verifyPlaced.type !== piece.type || verifyPlaced.color !== piece.color) {
-      console.error('[Time Travel] Piece placement verification failed!', {
-        expected: piece,
-        actual: verifyPlaced,
-        square: targetSquare,
-      });
-      throw new Error(`Time travel failed: piece placement verification failed at ${targetSquare}`);
-    }
-
-    // Fix turn synchronization: After time travel arrival, it's the opponent's turn.
-    // We need to flip the turn in the FEN. Since chess.put() doesn't modify turn,
-    // we reload the FEN with the correct turn.
-    const currentFen = newTl.chess.fen();
-    const fenParts = currentFen.split(' ');
-    // After the time-traveling piece's color moves, it's the opponent's turn
-    fenParts[1] = isWhite ? 'b' : 'w';
-    // Reset en passant on new timeline (historical en passant no longer valid)
-    fenParts[3] = '-';
-    // Halfmove clock: reset if capture, otherwise increment
-    const wasCapture = existingPiece !== null;
-    if (wasCapture) {
-      fenParts[4] = '0';
-    } else {
-      fenParts[4] = String(parseInt(fenParts[4] || '0') + 1);
-    }
-    // Fullmove number: increment when it becomes white's turn (after black moved)
-    if (fenParts[1] === 'w') {
-      fenParts[5] = String(parseInt(fenParts[5] || '1') + 1);
-    }
-    const fixedFen = fenParts.join(' ');
-    const loadResult = newTl.chess.load(fixedFen);
-    if (!loadResult) {
-      console.error('[Time Travel] MISSING_BOARD_BUG: Failed to load turn-fixed FEN:', fixedFen, {
-        originalFen: fen,
-        currentFen,
-        newTimelineId: newId,
-      });
-    }
-
-    // Validate that the time-traveling player's king is not in check after arrival
-    // (moving player is isWhite ? 'w' : 'b', and FEN turn is already flipped to opponent)
-    const movingPlayerColor: 'w' | 'b' = isWhite ? 'w' : 'b';
-    const selfCheckValidation = validateNoSelfCheck(newTl.chess.fen(), movingPlayerColor);
-    if (!selfCheckValidation.valid) {
-      console.error('[Time Travel] CRITICAL: Time travel leaves own king in check!', {
-        fen: newTl.chess.fen(),
-        movingPlayerColor,
-        reason: selfCheckValidation.reason,
-      });
-      // TODO: Add rollback here using TimelineTransaction
-      throw new Error(`Illegal time travel: ${selfCheckValidation.reason}`);
-    }
-
-    console.log('[Time Travel] New timeline chess state:', newTl.chess.fen());
-    console.log('[Time Travel] New timeline board:', newTl.chess.board());
-
-    // Copy snapshots up to the branch point
     newTl.snapshots = [];
     for (let s = 0; s <= snapshotIdx; s++) {
       newTl.snapshots.push(this._deepCloneSnapshot(sourceTl.snapshots[s]));
     }
-
-    // Add the arrival snapshot (queen now on this timeline)
     newTl.snapshots.push(this._cloneBoard(newTl.chess));
 
-    // Record the time travel arrival as a move
-    newTl.moveHistory = [];
-    // Copy move history up to branch point
-    for (let m = 0; m < snapshotIdx; m++) {
-      if (m < sourceTl.moveHistory.length) {
-        newTl.moveHistory.push(JSON.parse(JSON.stringify(sourceTl.moveHistory[m])));
-      }
-    }
-    // Add the arrival move
+    newTl.moveHistory = sourceTl.moveHistory.slice(0, snapshotIdx).map((m) => ({ ...m }));
     newTl.moveHistory.push({
       from: sourceSquare,
       to: sourceSquare,
       piece: piece.type,
-      captured: capturedPiece?.type || null,
-      san: `${pieceChar}${sourceSquare}⟳←T${sourceTimelineId}`,  // Arrived via time travel
+      captured: plan.captured?.type || null,
+      san: `${pieceChar}${sourceSquare}⟳←T${sourceTimelineId}`,
       isWhite,
     });
-
-    // Validate snapshot consistency on the new timeline (same as branching code)
     this._validateSnapshotConsistency(newTl);
 
-    // Add history layers to the new timeline visual
     const newCol = Board3D.getTimeline(newId);
     if (newCol) {
       for (let h = newTl.moveHistory.length - 1; h >= 0; h--) {
         const mv = newTl.moveHistory[h];
-        const boardBefore = this._getSnapshotBoard(newTl.snapshots[h]);
-        newCol.addSnapshot(boardBefore, mv.from, mv.to, mv.isWhite);
+        newCol.addSnapshot(this._getSnapshotBoard(newTl.snapshots[h]), mv.from, mv.to, mv.isWhite);
       }
     }
 
-    // 3. Add time travel connection line (vertical drop then horizontal)
-    Board3D.addTimeTravelLine(
-      sourceTimelineId,
-      targetTurnIndex,
-      newId,
-      sourceSquare,
-      isWhite
-    );
+    // 3. Connection line (vertical drop then horizontal)
+    Board3D.addTimeTravelLine(sourceTimelineId, targetTurnIndex, newId, sourceSquare, isWhite);
 
     // 4. Switch to the new timeline (respect camera follow setting for CPU mode)
-    console.log('[Time Travel] VISUAL_TRAILS_DEBUG: About to render after time travel', {
-      timestamp: Date.now(),
-      sourceTimelineId,
-      newTimelineId: newId,
-      sourceSquare,
-    });
     this.clearSelection();
     const shouldFocus = !this.cpuEnabled || this.cpuCameraFollow;
     this.setActiveTimeline(newId, shouldFocus);
     this.renderTimeline(sourceTimelineId);
     this.renderTimeline(newId);
+    this._afterMove();
 
-    // Validate no duplicate sprites after time travel renders
-    // Pass current board state so we can do a full rebuild if needed
-    // (sourceCol and newCol are already declared earlier in this function)
-    if (sourceCol) {
-      sourceCol.validateNoDuplicates(sourceTl.chess.board());
-    }
-    if (newCol) {
-      newCol.validateNoDuplicates(newTl.chess.board());
-    }
-
-    console.log('[Time Travel] VISUAL_TRAILS_DEBUG: Render complete', {
-      timestamp: Date.now(),
-    });
-    this.updateTimelineList();
-    this._updateMoveSlider();
-
-    // Spawn portal effect at arrival point
     Board3D.spawnPortalEffect(newId, sourceSquare);
-
-    // If captured a piece, also spawn capture effect
-    if (capturedPiece) {
+    if (plan.captured) {
       Board3D.spawnCaptureEffect(newId, sourceSquare);
     }
-
-    // TURN DEBUG: Log final state after time travel move
-    console.log('[TURN_DEBUG] _makeTimeTravelMove COMPLETE:', {
-      sourceTimelineId,
-      sourceTimelineName: sourceTl.name,
-      sourceFenAfter: sourceTl.chess.fen(),
-      sourceTurnAfter: sourceTl.chess.turn(),
-      newTimelineId: newId,
-      newTimelineName: newTl.name,
-      newTimelineFen: newTl.chess.fen(),
-      newTimelineTurn: newTl.chess.turn(),
-    });
+    return true;
   }
 
-  /** Helper: Modify a FEN string to change a square's piece and flip turn.
-   * Also updates castling rights, en passant, halfmove clock, and fullmove number.
-   * Uses utility functions from gameUtils.ts for clean, testable logic.
-   * @param isCapture - Set to true if this modification represents a capture
-   * @param skipSelfCheckValidation - Set to true to skip self-check validation (for source timeline removal)
-   */
-  private _modifyFen(fen: string, square: Square, newPiece: Piece | null, whiteToMove: boolean, isCapture: boolean = false, skipSelfCheckValidation: boolean = false): string {
-    // Use the centralized modifyFen utility which handles all FEN modification logic
-    // including castling rights, en passant reset, halfmove clock, and fullmove number
-    const result = modifyFenUtil({
-      fen,
-      square,
-      newPiece,
-      whiteToMove,
-      isCapture,
-      resetEnPassant: true,  // Always reset en passant on time travel/cross-timeline
-    });
-
-    // Validate the result
-    if (!isValidFen(result)) {
-      console.error('[_modifyFen] CRITICAL: Generated invalid FEN!', {
-        input: fen,
-        output: result,
-        square,
-        newPiece,
-      });
-      throw new Error(`FEN modification failed: invalid result "${result}" from input "${fen}" (square=${square}, newPiece=${JSON.stringify(newPiece)})`);
+  /** Shared UI refresh after any committed move */
+  private _afterMove(): void {
+    this.updateStatus();
+    this.updateMoveList();
+    this.updateTimelineList();
+    this._updateMoveSlider();
+    // The CPU loop reports game end itself; human games need it here
+    if (!this.cpuEnabled && this.isGlobalGameOver()) {
+      this._handleGameEnd();
     }
-
-    // Validate kings are still correct
-    const kingValidation = validateKings(result);
-    if (!kingValidation.valid) {
-      console.error('[_modifyFen] CRITICAL: Invalid king count after FEN modification!', {
-        input: fen,
-        output: result,
-        whiteKings: kingValidation.whiteKings,
-        blackKings: kingValidation.blackKings,
-      });
-      throw new Error(`FEN modification resulted in invalid king count: white=${kingValidation.whiteKings}, black=${kingValidation.blackKings}`);
-    }
-
-    // Validate that the moving player's king is not left in check
-    // whiteToMove indicates whose turn it is AFTER the move, so the moving player is the opposite
-    // Skip this validation for source timeline removal (the piece is leaving, check validation
-    // happens on the target timeline where the piece arrives)
-    if (!skipSelfCheckValidation) {
-      const movingPlayerColor: 'w' | 'b' = whiteToMove ? 'b' : 'w';
-      const selfCheckValidation = validateNoSelfCheck(result, movingPlayerColor);
-      if (!selfCheckValidation.valid) {
-        console.error('[_modifyFen] CRITICAL: Move leaves own king in check!', {
-          input: fen,
-          output: result,
-          square,
-          newPiece,
-          movingPlayerColor,
-          reason: selfCheckValidation.reason,
-        });
-        throw new Error(`Illegal teleport: ${selfCheckValidation.reason}`);
-      }
-    }
-
-    return result;
   }
 
   /* -- Promotion UI -- */
@@ -2591,6 +1581,11 @@ timelines - list timelines`,
     }
     this.selected = null;
     this.selectedTimelineId = null;
+    // Dismiss a promotion picker that no longer matches the board
+    if (this.pendingPromotion) {
+      this.pendingPromotion = null;
+      document.getElementById('promotion-picker')?.remove();
+    }
   }
 
   /** Show cross-timeline target indicators in other timelines */
@@ -2710,20 +1705,7 @@ timelines - list timelines`,
     return snapshot.fen;
   }
 
-  // Helper to get turn from snapshot
-  private _getSnapshotTurn(snapshot: AnySnapshot): string | null {
-    const fen = this._getSnapshotFen(snapshot);
-    if (fen) {
-      // FEN format: "position turn castling enpassant halfmove fullmove"
-      // Turn is the second field
-      return fen.split(' ')[1]; // 'w' or 'b'
-    }
-    return null;
-  }
 
-  private _fromSq(sq: string): { r: number; c: number } {
-    return { r: 8 - parseInt(sq[1]), c: sq.charCodeAt(0) - 97 };
-  }
 
   /* -- UI updates -- */
   updateStatus(): void {
@@ -2735,26 +1717,6 @@ timelines - list timelines`,
     const turn = chess.turn() === 'w' ? 'White' : 'Black';
     const prefix =
       Object.keys(this.timelines).length > 1 ? '[' + tl.name + '] ' : '';
-
-    // TURN DEBUG: Log status update with full turn state for all timelines
-    const allTimelinesTurnState: Record<string, { name: string; turn: string; fen: string; moveCount: number }> = {};
-    for (const tlIdStr of Object.keys(this.timelines)) {
-      const t = this.timelines[parseInt(tlIdStr)];
-      allTimelinesTurnState[tlIdStr] = {
-        name: t.name,
-        turn: t.chess.turn(),
-        fen: t.chess.fen(),
-        moveCount: t.moveHistory.length,
-      };
-    }
-    console.log('[TURN_DEBUG] updateStatus:', {
-      activeTimelineId: this.activeTimelineId,
-      activeTimelineName: tl.name,
-      displayingTurn: turn,
-      chessTurn: chess.turn(),
-      fen: chess.fen(),
-      allTimelines: allTimelinesTurnState,
-    });
 
     if (chess.in_checkmate()) {
       const winner = chess.turn() === 'w' ? 'Black' : 'White';
@@ -2970,70 +1932,6 @@ timelines - list timelines`,
     }
   }
 
-  /* -- Branch Point Indicators -- */
-  private _highlightConnectedTimelines(tlId: number, highlight: boolean): void {
-    // Cancel any pending highlight operation
-    if (this._highlightDebounceTimer !== null) {
-      clearTimeout(this._highlightDebounceTimer);
-      this._highlightDebounceTimer = null;
-    }
-
-    // For unhighlight, execute immediately to avoid lingering highlights
-    // For highlight, debounce to prevent flicker during rapid hover changes (e.g., CPU play)
-    if (!highlight) {
-      this._executeHighlight(tlId, false);
-    } else {
-      this._highlightDebounceTimer = window.setTimeout(() => {
-        this._executeHighlight(tlId, true);
-        this._highlightDebounceTimer = null;
-      }, this._highlightDebounceDelay);
-    }
-  }
-
-  private _executeHighlight(tlId: number, highlight: boolean): void {
-    const tl = this.timelines[tlId];
-    if (!tl) return;
-
-    // Find all connected timelines (parent and children)
-    const connected: number[] = [];
-
-    // Add parent
-    if (tl.parentId !== null) {
-      connected.push(tl.parentId);
-    }
-
-    // Add children
-    for (const key in this.timelines) {
-      const other = this.timelines[key];
-      if (other.parentId === tlId) {
-        connected.push(other.id);
-      }
-    }
-
-    // Highlight/unhighlight in UI
-    const listEl = document.getElementById('timeline-list');
-    if (listEl) {
-      connected.forEach((connectedId) => {
-        const item = listEl.querySelector('[data-tl-id="' + connectedId + '"]');
-        if (item) {
-          if (highlight) {
-            item.classList.add('connected-highlight');
-          } else {
-            item.classList.remove('connected-highlight');
-          }
-        }
-      });
-    }
-
-    // Highlight in 3D view
-    connected.forEach((connectedId) => {
-      const col = Board3D.getTimeline(connectedId);
-      if (col) {
-        col.setHighlighted(highlight);
-      }
-    });
-  }
-
   /* -- Get branch points for a timeline -- */
   getBranchPoints(tlId: number): { childId: number; moveIndex: number; name: string }[] {
     const branches: { childId: number; moveIndex: number; name: string }[] = [];
@@ -3127,7 +2025,8 @@ timelines - list timelines`,
 
     for (const key in this.timelines) {
       const tl = this.timelines[parseInt(key)];
-      totalMoves += tl.chess.history().length;
+      // Branches copy their parent's history up to the branch point; count only their own moves
+      totalMoves += tl.moveHistory.length - (tl.parentId === null ? 0 : Math.max(0, tl.branchTurn));
 
       if (tl.chess.in_checkmate()) {
         if (tl.chess.turn() === 'w') blackWins++;
@@ -3269,25 +2168,25 @@ timelines - list timelines`,
     // Stop CPU if running
     this.cpuStop();
     this.cpuGlobalTurn = 'w';
+    this.clearSelection();
+    this.recentCrossTimelineMoves = [];
 
     Board3D.clearAll();
     this.timelines = {};
     this.nextTimelineId = 1;
-    this.selected = null;
-    this.selectedTimelineId = null;
+    this.viewingMoveIndex = null;
+    this._lastMoveListHtml = '';
+    this._lastTimelineStructure = '';
     const movesEl = document.getElementById('moves');
     if (movesEl) {
       movesEl.innerHTML = '';
     }
+    document.getElementById('game-end-toast')?.remove();
 
     this._createTimeline(0, 0, null, -1, null);
     this.setActiveTimeline(0);
     this.renderTimeline(0);
-    this.updateStatus();
-    this.updateTimelineList();
-
-    // Setup collapsible shortcuts panel
-    this._setupCollapsibleShortcuts();
+    this._afterMove();
   }
 
   /* -- CPU Mode -- */
@@ -3300,8 +2199,12 @@ timelines - list timelines`,
   private cpuCameraFollow = true;  // Auto-follow moves with camera
   private cpuGlobalTurn: PieceColor = 'w';  // Track whose turn globally (independent of per-timeline state)
 
-  // Race condition prevention: lock to prevent concurrent move execution
+  // Lock held while a CPU move (including the engine search) is in progress
   private cpuMoveInProgress = false;
+  // Incremented on start/stop/reset so stale async ticks can detect they are obsolete
+  private cpuGeneration = 0;
+  // Boards still to be played by the side to move in the current global turn (null = not started)
+  private cpuTurnQueue: number[] | null = null;
 
   // Per-color CPU settings
   private cpuWhiteEnabled = true;
@@ -3332,18 +2235,24 @@ timelines - list timelines`,
   private cpuStockfishSkillBlack = 10;  // Skill level 0-20 for Black
   private cpuStockfishDepth = 10;  // Search depth 1-20
 
+  /** True when the CPU is running and plays this color, so humans may not move it */
+  private _isCpuControlled(color: PieceColor): boolean {
+    return this.cpuEnabled && (color === 'w' ? this.cpuWhiteEnabled : this.cpuBlackEnabled);
+  }
+
   /** Start CPU auto-play mode */
   cpuStart(): void {
     if (this.cpuEnabled) return;
 
     // Check if game is already over (all timelines in checkmate/stalemate)
     if (this._cpuIsGameOver()) {
-      console.log('[CPU] Cannot start - all timelines already in checkmate/stalemate');
       return;
     }
 
     this.cpuEnabled = true;
-    this.cpuMoveInProgress = false;  // Ensure clean state on start
+    this.cpuGeneration++;
+    this.cpuTurnQueue = null;
+    this.cpuMoveInProgress = false;
     this._cpuTick();
     this._updateCpuUI();
   }
@@ -3351,7 +2260,9 @@ timelines - list timelines`,
   /** Stop CPU auto-play mode */
   cpuStop(): void {
     this.cpuEnabled = false;
-    this.cpuMoveInProgress = false;  // Clear any pending move lock
+    this.cpuGeneration++;  // Invalidate any tick still awaiting the engine
+    this.cpuMoveInProgress = false;
+    stockfish.stop();
     if (this.cpuTimer !== null) {
       clearTimeout(this.cpuTimer);
       this.cpuTimer = null;
@@ -3410,108 +2321,68 @@ timelines - list timelines`,
 
   /** Main CPU tick - called repeatedly while enabled */
   private async _cpuTick(): Promise<void> {
-    if (!this.cpuEnabled) return;
+    if (!this.cpuEnabled || this.cpuMoveInProgress) return;
+    const generation = this.cpuGeneration;
+    this.cpuTimer = null;
 
-    // RACE CONDITION PREVENTION: If a move is already in progress OR pending, skip this tick
-    // This prevents overlapping move execution when setTimeout callbacks fire during long operations
-    // BUG FIX: Also check cpuPendingMove - a move might be scheduled but not yet executed
-    if (this.cpuMoveInProgress || this.cpuPendingMove) {
-      console.log('[CPU] Move in progress or pending, skipping tick', {
-        inProgress: this.cpuMoveInProgress,
-        pending: !!this.cpuPendingMove,
-      });
-      this.cpuTimer = window.setTimeout(() => this._cpuTick(), this.cpuMoveDelay);
-      return;
-    }
-
-    // Check if ALL timelines are finished (checkmate or stalemate)
-    // If so, stop CPU to avoid spinning forever
+    // Stop when every timeline is finished (checkmate, stalemate or draw)
     if (this._cpuIsGameOver()) {
-      console.log('[CPU] All timelines finished - stopping CPU');
       this.cpuStop();
       this._handleGameEnd();
       return;
     }
 
-    // Check if this color's CPU is enabled
     const isWhiteTurn = this.cpuGlobalTurn === 'w';
     const cpuActiveForColor = isWhiteTurn ? this.cpuWhiteEnabled : this.cpuBlackEnabled;
+    const playable = new Set(cpuActiveForColor ? this._cpuGetPlayableTimelines() : []);
 
-    if (!cpuActiveForColor) {
-      // This color's CPU is disabled, flip turn and continue
-      this.cpuGlobalTurn = isWhiteTurn ? 'b' : 'w';
-      this.cpuTimer = window.setTimeout(() => this._cpuTick(), this.cpuMoveDelay);
-      return;
+    // Each global turn, the side to move plays once on every board where it is their move.
+    // Boards that stopped being playable (e.g. a cross-timeline arrival flipped them) drop out.
+    if (this.cpuTurnQueue === null) {
+      this.cpuTurnQueue = [...playable];
     }
+    this.cpuTurnQueue = this.cpuTurnQueue.filter((id) => playable.has(id));
 
-    // Find ALL playable timelines for current color and make moves on each
-    const playableTimelines = this._cpuGetPlayableTimelines();
-
-    if (playableTimelines.length === 0) {
-      // No playable timelines for this color - flip turn and keep ticking
-      this.cpuGlobalTurn = isWhiteTurn ? 'b' : 'w';
-      this.cpuTimer = window.setTimeout(() => this._cpuTick(), this.cpuMoveDelay);
-      return;
-    }
-
-    // RACE CONDITION PREVENTION: Acquire lock before making move
-    this.cpuMoveInProgress = true;
-
-    try {
-      // 5D-aware timeline selection: prioritize based on tactical evaluation
-      const tlId = this._cpuSelectBestTimeline(playableTimelines);
-      const moved = await this._cpuMakeMove(tlId);
-
-      if (moved) {
-        // After successful move, flip global turn
-        this.cpuGlobalTurn = isWhiteTurn ? 'b' : 'w';
-      } else {
-        // Move failed - flip turn anyway to avoid getting stuck in infinite loop
-        console.warn('[CPU] Move failed, flipping turn to avoid stuck state');
-        this.cpuGlobalTurn = isWhiteTurn ? 'b' : 'w';
+    if (this.cpuTurnQueue.length > 0) {
+      this.cpuMoveInProgress = true;
+      try {
+        const tlId = this._cpuSelectBestTimeline(this.cpuTurnQueue);
+        this.cpuTurnQueue = this.cpuTurnQueue.filter((id) => id !== tlId);
+        const moved = await this._cpuMakeMove(tlId, generation);
+        if (!moved && generation === this.cpuGeneration) {
+          console.warn('[CPU] No move made on timeline', tlId);
+        }
+      } catch (error) {
+        console.error('[CPU] Error during move execution:', error);
+      } finally {
+        if (generation === this.cpuGeneration) this.cpuMoveInProgress = false;
       }
-    } catch (error) {
-      // Fatal error - flip turn and continue to prevent hanging
-      console.error('[CPU] Fatal error during move execution:', error);
-      this.cpuGlobalTurn = isWhiteTurn ? 'b' : 'w';
-    } finally {
-      // RACE CONDITION PREVENTION: Release lock after move completes
-      this.cpuMoveInProgress = false;
     }
 
-    // Schedule next tick
+    // A stop/start or reset while awaiting the engine invalidates this tick
+    if (generation !== this.cpuGeneration || !this.cpuEnabled) return;
+    if (this.cpuTurnQueue.length === 0) {
+      this.cpuGlobalTurn = isWhiteTurn ? 'b' : 'w';
+      this.cpuTurnQueue = null;
+    }
+    this._scheduleCpuTick();
+  }
+
+  private _scheduleCpuTick(): void {
+    if (this.cpuTimer !== null) clearTimeout(this.cpuTimer);
     this.cpuTimer = window.setTimeout(() => this._cpuTick(), this.cpuMoveDelay);
   }
 
   /** Check if game is completely over - all timelines in checkmate, stalemate, or draw */
   private _cpuIsGameOver(): boolean {
-    for (const key in this.timelines) {
-      const tl = this.timelines[parseInt(key)];
-      // If any timeline is NOT in checkmate/stalemate/draw, game is not over
-      if (!tl.chess.in_checkmate() && !tl.chess.in_stalemate() && !tl.chess.in_draw()) {
-        return false;
-      }
-    }
-    // All timelines finished
-    return true;
+    return Object.values(this.timelines).every((tl) => this.isTimelineFinished(tl));
   }
 
   /** Get all timelines where current color can play */
   private _cpuGetPlayableTimelines(): number[] {
-    const playable: number[] = [];
-
-    for (const key in this.timelines) {
-      const tl = this.timelines[parseInt(key)];
-      // Timeline is playable if it's this color's turn AND not in checkmate/stalemate/draw
-      if (tl.chess.turn() === this.cpuGlobalTurn &&
-          !tl.chess.in_checkmate() &&
-          !tl.chess.in_stalemate() &&
-          !tl.chess.in_draw()) {
-        playable.push(tl.id);
-      }
-    }
-
-    return playable;
+    return Object.values(this.timelines)
+      .filter((tl) => tl.chess.turn() === this.cpuGlobalTurn && !this.isTimelineFinished(tl))
+      .map((tl) => tl.id);
   }
 
   /**
@@ -3545,6 +2416,7 @@ timelines - list timelines`,
     const isWhite = this.cpuGlobalTurn === 'w';
     let bestTlId = playable[0];
     let bestScore = -Infinity;
+    const avgMoves = playable.reduce((sum, id) => sum + (this.timelines[id]?.moveHistory.length || 0), 0) / playable.length;
 
     for (const tlId of playable) {
       const tl = this.timelines[tlId];
@@ -3552,49 +2424,23 @@ timelines - list timelines`,
 
       let score = 0;
       const chess = tl.chess;
-
-      // Priority 1: We can give check (high priority)
       const moves = chess.moves({ verbose: true }) as ChessMove[];
-      const checkMoves = moves.filter((m) => m.san?.includes('+'));
-      if (checkMoves.length > 0) score += 50;
-
-      // Priority 2: We're in check (need to respond)
+      // Check opportunities, being in check, captures
+      if (moves.some((m) => m.san?.includes('+'))) score += 50;
       if (chess.in_check()) score += 40;
+      score += moves.filter((m) => m.captured).length * 5;
 
-      // Priority 3: Capture opportunities
-      const captureMoves = moves.filter((m) => m.captured);
-      score += captureMoves.length * 5;
-
-      // Priority 4: Material evaluation (press advantage or defend weakness)
+      // Press an advantage or defend a weakness
       const material = this._evaluateMaterial(chess.fen());
-      // If white: positive material is good. If black: negative material is good
-      const advantageMultiplier = isWhite ? material : -material;
-      if (advantageMultiplier > 0) {
-        // We have advantage - prioritize attacking here
-        score += advantageMultiplier * 3;
-      } else if (advantageMultiplier < 0) {
-        // We're behind - prioritize defending here
-        score += Math.abs(advantageMultiplier) * 2;
-      }
+      const advantage = isWhite ? material : -material;
+      score += advantage > 0 ? advantage * 3 : Math.abs(advantage) * 2;
 
-      // Priority 5: Balance play across boards (prefer less-played timelines)
-      // This prevents one board from getting 168 moves while another has 8
+      // Balance play across boards (prefer less-played timelines)
       const moveCount = tl.moveHistory.length;
-      const avgMoves = playable.reduce((sum, id) => {
-        const t = this.timelines[id];
-        return sum + (t ? t.moveHistory.length : 0);
-      }, 0) / playable.length;
-      if (moveCount < avgMoves * 0.5) {
-        // This board has less than half the average moves - prioritize it
-        score += 20;
-      } else if (moveCount < avgMoves * 0.8) {
-        // Moderately under-played
-        score += 10;
-      }
+      if (moveCount < avgMoves * 0.5) score += 20;
+      else if (moveCount < avgMoves * 0.8) score += 10;
 
-      // Small random factor to avoid being too predictable
       score += Math.random() * 5;
-
       if (score > bestScore) {
         bestScore = score;
         bestTlId = tlId;
@@ -3604,227 +2450,85 @@ timelines - list timelines`,
     return bestTlId;
   }
 
-  // CPU pending move state
-  private cpuPendingMove: {
-    tlId: number;
-    move: ChessMove;
-    isWhite: boolean;
-    isTimeTravel: boolean;
-    isCrossTimeline: boolean;
-    timeTravelData?: { sourceSquare: Square; targetTurnIndex: number; piece: Piece; capturedPiece: Piece | null | undefined };
-    crossTimelineData?: { targetTimelineId: number; sourceSquare: Square; targetSquare: Square; piece: Piece };
-  } | null = null;
-
-  /** Make a CPU move on the given timeline (with preview pause) */
-  private async _cpuMakeMove(tlId: number): Promise<boolean> {
+  /** Make a CPU move on the given timeline. Returns true if a move was made. */
+  private async _cpuMakeMove(tlId: number, generation: number): Promise<boolean> {
     const tl = this.timelines[tlId];
-    if (!tl) return false;
-
-    // RACE CONDITION CHECK: Verify this timeline's turn matches global turn
-    // This catches edge cases where state changed between selection and execution
-    if (tl.chess.turn() !== this.cpuGlobalTurn) {
-      console.error('[CPU] RACE CONDITION DETECTED: Turn mismatch!', {
-        timelineId: tlId,
-        timelineTurn: tl.chess.turn(),
-        globalTurn: this.cpuGlobalTurn,
-      });
-      return false;
-    }
-
-    // Double-check: refuse to move if in checkmate, stalemate, or draw
-    if (tl.chess.in_checkmate() || tl.chess.in_stalemate() || tl.chess.in_draw()) {
-      console.log('[CPU] Skipping timeline', tlId, '- already in checkmate/stalemate/draw');
-      return false;
-    }
+    if (!tl || tl.chess.turn() !== this.cpuGlobalTurn || this.isTimelineFinished(tl)) return false;
 
     const isWhite = tl.chess.turn() === 'w';
     const capturePreference = isWhite ? this.cpuWhiteCapturePreference : this.cpuBlackCapturePreference;
 
-    // Switch to this timeline and animate camera if follow mode enabled
     if (this.activeTimelineId !== tlId) {
       this.setActiveTimeline(tlId, this.cpuCameraFollow);
     }
 
-    // Get legal moves
     const moves = tl.chess.moves({ verbose: true }) as ChessMove[];
-    if (moves.length === 0) {
-      console.log('[CPU] No legal moves on timeline', tlId);
-      return false;
-    }
+    if (moves.length === 0) return false;
 
-    // Check for time travel opportunity (if under timeline limit)
-    // _cpuCheckTimeTravel already handles per-piece bias checks internally
+    Board3D.clearAllCpuPreviews();
+
+    // Time travel opportunity (if under timeline limit)
     if (Object.keys(this.timelines).length < this.maxTimelines) {
-      const timeTravelMove = this._cpuCheckTimeTravel(tlId);
-      if (timeTravelMove) {
-        // Store pending move and execute immediately (indicator shown after)
-        this.cpuPendingMove = {
-          tlId,
-          move: { from: timeTravelMove.sourceSquare, to: timeTravelMove.sourceSquare } as ChessMove,
-          isWhite,
-          isTimeTravel: true,
-          isCrossTimeline: false,
-          timeTravelData: {
-            sourceSquare: timeTravelMove.sourceSquare,
-            targetTurnIndex: timeTravelMove.targetTurnIndex,
-            piece: timeTravelMove.piece,
-            capturedPiece: timeTravelMove.isCapture ? timeTravelMove.capturedPiece : null,
-          },
-        };
-
-        // Execute and return actual success status
-        return this._cpuExecutePendingMove();
+      const tt = this._cpuCheckTimeTravel(tlId);
+      if (tt && this._makeTimeTravelMove(tlId, tt.sourceSquare, tt.targetTurnIndex, tt.piece)) {
+        this._flashCpuPreview(tlId, tt.sourceSquare, tt.sourceSquare, isWhite, true);
+        return true;
       }
     }
 
-    // Check for cross-timeline opportunity (can always happen if multiple timelines exist)
-    const crossTimelineMove = this._cpuCheckCrossTimeline(tlId);
-    if (crossTimelineMove) {
-      // Store pending move and execute immediately (indicator shown after)
-      this.cpuPendingMove = {
-        tlId,
-        move: { from: crossTimelineMove.sourceSquare, to: crossTimelineMove.targetSquare } as ChessMove,
-        isWhite,
-        isTimeTravel: false,
-        isCrossTimeline: true,
-        crossTimelineData: {
-          targetTimelineId: crossTimelineMove.targetTimelineId,
-          sourceSquare: crossTimelineMove.sourceSquare,
-          targetSquare: crossTimelineMove.targetSquare,
-          piece: crossTimelineMove.piece,
-        },
-      };
-
-      // Execute and return actual success status
-      return this._cpuExecutePendingMove();
+    // Cross-timeline opportunity
+    const cross = this._cpuCheckCrossTimeline(tlId);
+    if (cross && this.makeCrossTimelineMove(tlId, cross.targetTimelineId, cross.sourceSquare, cross.targetSquare, cross.piece)) {
+      this._flashCpuPreview(tlId, cross.sourceSquare, cross.targetSquare, isWhite, false);
+      return true;
     }
 
-    // Use Stockfish for move selection if available, otherwise fall back to random
-    const move = await this._selectCpuMove(tlId, tl.chess.fen(), moves, capturePreference, isWhite);
-    if (!move) {
-      console.warn('[CPU] No move selected, skipping');
+    // Regular move: Stockfish if available, otherwise weighted random
+    const fen = tl.chess.fen();
+    const move = await this._selectCpuMove(fen, moves, capturePreference, isWhite);
+    // Abort if the CPU was stopped/reset or the board changed while the engine was thinking
+    if (!move || generation !== this.cpuGeneration || !this.timelines[tlId] || tl.chess.fen() !== fen) {
       return false;
     }
+    if (!this.makeMove(tlId, move, move.promotion)) return false;
+    this._flashCpuPreview(tlId, move.from, move.to, isWhite, false);
+    return true;
+  }
 
-    // Store pending move and execute immediately (indicator shown after)
-    this.cpuPendingMove = { tlId, move, isWhite, isTimeTravel: false, isCrossTimeline: false };
-
-    // Execute and return actual success status
-    return this._cpuExecutePendingMove();
+  private _flashCpuPreview(tlId: number, from: string, to: string, isWhite: boolean, isTimeTravel: boolean): void {
+    const col = Board3D.getTimeline(tlId);
+    if (!col) return;
+    col.showCpuMovePreview(from, to, isWhite, isTimeTravel);
+    window.setTimeout(() => col.clearCpuMovePreview(), 800);
   }
 
   /** Select a CPU move using Stockfish or random fallback */
   private async _selectCpuMove(
-    tlId: number,
     fen: string,
     moves: ChessMove[],
     capturePreference: number,
     isWhite: boolean
   ): Promise<ChessMove | null> {
-    // Try Stockfish first if enabled
     if (this.cpuUseStockfish && stockfish.available) {
       try {
-        // Set skill level based on whose turn it is
-        const skillLevel = isWhite ? this.cpuStockfishSkillWhite : this.cpuStockfishSkillBlack;
-        stockfish.setSkillLevel(skillLevel);
+        stockfish.setSkillLevel(isWhite ? this.cpuStockfishSkillWhite : this.cpuStockfishSkillBlack);
         const sfMove = await stockfish.getBestMove(fen, this.cpuStockfishDepth);
         if (sfMove) {
-          // Find matching move in legal moves list
+          const promotion = sfMove.promotion || undefined;
           const matchingMove = moves.find(
-            (m) => m.from === sfMove.from && m.to === sfMove.to
+            (m) => m.from === sfMove.from && m.to === sfMove.to && (!m.promotion || m.promotion === (promotion || 'q'))
           );
-          if (matchingMove) {
-            // If Stockfish suggests a promotion, use it
-            if (sfMove.promotion) {
-              matchingMove.promotion = sfMove.promotion as 'n' | 'b' | 'r' | 'q';
-            }
-            return matchingMove;
-          }
+          if (matchingMove) return matchingMove;
         }
       } catch (error) {
         console.warn('[CPU] Stockfish error, falling back to random:', error);
       }
     }
 
-    // Fallback: pick a random legal move (with preference for captures)
+    // Fallback: random legal move with a preference for captures
     const captures = moves.filter((m) => m.captured);
-    let move: ChessMove;
-
-    if (captures.length > 0 && Math.random() < capturePreference) {
-      move = captures[Math.floor(Math.random() * captures.length)];
-    } else {
-      move = moves[Math.floor(Math.random() * moves.length)];
-    }
-
-    return move;
-  }
-
-  /** Execute the pending CPU move and show indicator after. Returns true if successful. */
-  private _cpuExecutePendingMove(): boolean {
-    if (!this.cpuPendingMove) return false;
-
-    const { tlId, move, isWhite, isTimeTravel, isCrossTimeline, timeTravelData, crossTimelineData } = this.cpuPendingMove;
-    this.cpuPendingMove = null;
-
-    // Clear any existing indicators first
-    Board3D.clearAllCpuPreviews();
-
-    try {
-      if (isTimeTravel && timeTravelData) {
-        // Execute time travel move
-        console.log('[CPU] Time traveling!', { timeline: tlId });
-        this._makeTimeTravelMove(
-          tlId,
-          timeTravelData.sourceSquare,
-          timeTravelData.targetTurnIndex,
-          timeTravelData.piece,
-          timeTravelData.capturedPiece
-        );
-        // Show indicator on source square after move completes
-        const col = Board3D.getTimeline(tlId);
-        if (col) {
-          col.showCpuMovePreview(timeTravelData.sourceSquare, timeTravelData.sourceSquare, isWhite, true);
-          window.setTimeout(() => col.clearCpuMovePreview(), 800);
-        }
-        return true;
-      } else if (isCrossTimeline && crossTimelineData) {
-        // Execute cross-timeline move
-        console.log('[CPU] Crossing timelines!', {
-          from: tlId,
-          to: crossTimelineData.targetTimelineId,
-          piece: crossTimelineData.piece.type,
-          sourceSquare: crossTimelineData.sourceSquare,
-          targetSquare: crossTimelineData.targetSquare,
-        });
-        this.makeCrossTimelineMove(
-          tlId,
-          crossTimelineData.targetTimelineId,
-          crossTimelineData.sourceSquare,
-          crossTimelineData.targetSquare,
-          crossTimelineData.piece
-        );
-        // Show indicator on source square after move completes
-        const col = Board3D.getTimeline(tlId);
-        if (col) {
-          col.showCpuMovePreview(crossTimelineData.sourceSquare, crossTimelineData.targetSquare, isWhite, false);
-          window.setTimeout(() => col.clearCpuMovePreview(), 800);
-        }
-        return true;
-      } else {
-        // Execute normal move (auto-queen for CPU promotions)
-        this.makeMove(tlId, move, move.promotion ? 'q' : undefined);
-        // Show indicator from->to after move completes
-        const col = Board3D.getTimeline(tlId);
-        if (col) {
-          col.showCpuMovePreview(move.from, move.to, isWhite, false);
-          window.setTimeout(() => col.clearCpuMovePreview(), 800);
-        }
-        return true;
-      }
-    } catch (error) {
-      console.error('[CPU] Move execution failed:', error);
-      return false;
-    }
+    const pool = captures.length > 0 && Math.random() < capturePreference ? captures : moves;
+    return pool[Math.floor(Math.random() * pool.length)];
   }
 
   /** Check if CPU has a time travel opportunity on this timeline */
@@ -3864,7 +2568,7 @@ timelines - list timelines`,
       }
     }
 
-    if (opportunities.length === 0) return null;
+    if (opportunities.length === 0 || Math.random() >= this.cpuTimeTravelChance) return null;
 
     // For each opportunity, roll dice based on its bias
     // Prefer captures, use highest-bias piece type
@@ -3999,13 +2703,6 @@ timelines - list timelines`,
     for (const opp of opportunities) {
       // LOOP DETECTION: Check if this would be a ping-pong move
       if (this._wouldBePingPongMove(tlId, opp.targetTimelineId, opp.targetSquare, opp.piece.type)) {
-        console.log('[CPU 5D] Skipping cross-timeline - would be ping-pong', {
-          from: tlId,
-          to: opp.targetTimelineId,
-          piece: opp.piece.type,
-          sourceSquare: opp.sourceSquare,
-          targetSquare: opp.targetSquare,
-        });
         continue; // Skip this opportunity, try next
       }
 
@@ -4015,16 +2712,6 @@ timelines - list timelines`,
       const totalChance = Math.min(0.95, baseChance + strategicBonus);
 
       if (Math.random() < totalChance) {
-        console.log('[CPU 5D] Cross-timeline move!', {
-          from: tlId,
-          to: opp.targetTimelineId,
-          piece: opp.piece.type,
-          sourceSquare: opp.sourceSquare,
-          targetSquare: opp.targetSquare,
-          isCapture: opp.isCapture,
-          strategicScore: opp.strategicScore,
-          chance: Math.round(totalChance * 100) + '%',
-        });
 
         // Record this move in history for loop detection
         this._recordCrossTimelineMove(tlId, opp.targetTimelineId, opp.targetSquare, opp.piece.type);

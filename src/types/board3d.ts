@@ -1,5 +1,5 @@
 import type * as THREE from 'three';
-import type { Board, ChessMove, PieceType } from './game';
+import type { Board, ChessMove } from './game';
 
 // ===============================================================
 // OrbitControls interface for CDN-loaded THREE.OrbitControls
@@ -123,7 +123,7 @@ export interface ITimelineCol {
    * If duplicates are found, logs an error with details and removes the extras.
    * @returns true if no duplicates were found, false if duplicates were detected and fixed
    */
-  validateNoDuplicates(): boolean;
+  pieceSpriteCount(): number;
 
   /**
    * Set 2D mode visibility for this timeline.

@@ -9,12 +9,21 @@
     "skipLibCheck": true,
     "allowJs": true,
     "checkJs": false,
-    "outDir": "./dist",
-    "rootDir": "./src",
     "declaration": false,
     "sourceMap": true,
-    "lib": ["ES2020", "DOM", "DOM.Iterable"]
+    "lib": [
+      "ES2020",
+      "DOM",
+      "DOM.Iterable"
+    ]
   },
-  "include": ["src/**/*"],
-  "exclude": ["node_modules", "dist"]
+  "include": [
+    "src/**/*",
+    "test/**/*",
+    "playwright.config.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist"
+  ]
 }
