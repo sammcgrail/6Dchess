@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { clickSquare, collectErrors, move, openGame } from './helpers';
+import { boards, clickSquare, collectErrors, move, openGame } from './helpers';
 
 test('sidebar lists only real timelines and switches on click', async ({ page }) => {
   const errors = collectErrors(page);
@@ -125,5 +125,35 @@ test('2D mode keeps every board on screen while playing', async ({ page }) => {
     expect(pt.y).toBeLessThan(canvas.y + canvas.height);
   }
   await page.screenshot({ path: 'test-results/screens/06-2d-mode.png' });
+  expect(errors).toEqual([]);
+});
+
+test('king in check is highlighted on its square', async ({ page }) => {
+  await openGame(page);
+  const checkSquare = () => page.evaluate(() => (window as any).ChessApp.Board3D.getTimeline(0).checkSquare);
+  await move(page, 0, 'e2', 'e4');
+  await move(page, 0, 'f7', 'f6');
+  expect(await checkSquare()).toBeNull();
+  await move(page, 0, 'd1', 'h5'); // Qh5+
+  expect(await checkSquare()).toBe(4); // e8 = row 0, col 4
+  await move(page, 0, 'g7', 'g6');
+  expect(await checkSquare()).toBeNull();
+});
+
+test('clicking a move reviews that position; clicking the board returns to the present', async ({ page }) => {
+  const errors = collectErrors(page);
+  await openGame(page);
+  await move(page, 0, 'e2', 'e4');
+  await move(page, 0, 'e7', 'e5');
+  await move(page, 0, 'g1', 'f3');
+  await page.locator('#moves .move[data-ply="1"]').click();
+  await expect(page.locator('#moves .move[data-ply="1"]')).toHaveClass(/current/);
+  await expect(page.locator('#moves .move[data-ply="3"]')).toHaveClass(/future/);
+  await expect(page.locator('#move-slider-label')).toContainText('1/3');
+  // A board click while reviewing returns to the live position instead of moving
+  await clickSquare(page, 0, 'b8');
+  await expect(page.locator('#move-slider-label')).toContainText('3/3');
+  await move(page, 0, 'b8', 'c6');
+  expect((await boards(page))[0].moveCount).toBe(4);
   expect(errors).toEqual([]);
 });

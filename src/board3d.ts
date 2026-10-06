@@ -83,6 +83,7 @@ const LIGHT_SQUARE = new THREE.Color(0x7878ac);
 const DARK_SQUARE = new THREE.Color(0x45456f);
 const SELECTED_SQUARE = new THREE.Color(0xd4b040);
 const HOVER_TINT = new THREE.Color(0xb8c4ff);
+const CHECK_SQUARE = new THREE.Color(0xd04848);
 const CHECKMATE_GLOW = new THREE.Color(0xff3333);
 const DRAW_GLOW = new THREE.Color(0xffa500);
 
@@ -682,11 +683,22 @@ export class TimelineCol implements ITimelineCol {
   }
 
   private hoveredSquare: number | null = null;
+  private checkSquare: number | null = null;
+
+  /** Mark the king in check (null clears) */
+  setCheckSquare(index: number | null): void {
+    if (index === this.checkSquare) return;
+    const previous = this.checkSquare;
+    this.checkSquare = index;
+    if (previous !== null) this._restoreSquare(previous);
+    if (index !== null) this._restoreSquare(index);
+  }
 
   /** Color for a square given selection and hover state */
   private _restoreSquare(index: number): void {
     const base = this._squareColor(Math.floor(index / 8), index % 8);
     if (index === this.selectedSquare) this._setSquareColor(index, SELECTED_SQUARE);
+    else if (index === this.checkSquare) this._setSquareColor(index, CHECK_SQUARE);
     else if (index === this.hoveredSquare) this._setSquareColor(index, HOVER_TINT.clone().lerp(base, 0.55));
     else this._setSquareColor(index, base);
   }
