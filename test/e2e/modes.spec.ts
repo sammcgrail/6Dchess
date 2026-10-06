@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { boards, collectErrors, expectLegalBoards, move, openGame } from './helpers';
+import { boards, clickSquare, collectErrors, expectLegalBoards, move, openGame } from './helpers';
 
 const totalMoves = async (page: import('@playwright/test').Page) =>
   (await boards(page)).reduce((n, b) => n + b.moveCount, 0);
@@ -62,4 +62,30 @@ test('hovering a square highlights it and shows a pointer', async ({ page }) => 
   await expect.poll(() => page.evaluate(() => (document.querySelector('#scene-container canvas') as HTMLElement).style.cursor)).toBe('pointer');
   await page.mouse.move(5, 880);
   await expect.poll(() => page.evaluate(() => (document.querySelector('#scene-container canvas') as HTMLElement).style.cursor)).toBe('');
+});
+
+test('vs CPU: CPU replies do not steal the active board or the human selection', async ({ page }) => {
+  const errors = collectErrors(page);
+  await openGame(page);
+  // Build two boards with White to move: Black's knight time-travels from f6
+  await move(page, 0, 'e2', 'e4');
+  await move(page, 0, 'g8', 'f6');
+  await move(page, 0, 'd2', 'd4');
+  await clickSquare(page, 0, 'f6');
+  await clickSquare(page, 0, 'f6', 1);
+  expect((await boards(page)).map((b) => b.turn)).toEqual(['w', 'w']);
+
+  await page.evaluate(() => (window as any).Game.cpuSetDelay(300));
+  await page.getByRole('radio', { name: 'vs CPU' }).click();
+  // Human moves on Main, then looks at Branch 1 and picks up a pawn while the CPU answers on Main
+  await move(page, 0, 'e4', 'e5');
+  await page.evaluate(() => (window as any).Game.setActiveTimeline(1, false));
+  await clickSquare(page, 1, 'd2');
+  await expect.poll(() => page.evaluate(() => (window as any).Game.getGameDebugState().boards[0].turn), { timeout: 20_000 }).toBe('w');
+  const state = await page.evaluate(() => ({ active: (window as any).Game.activeTimelineId, selected: (window as any).Game.selected }));
+  expect(state).toEqual({ active: 1, selected: 'd2' });
+  // ...and the human can still complete the move
+  await clickSquare(page, 1, 'd4');
+  expect((await boards(page)).find((b) => b.timelineId === 1)!.turn).toBe('b');
+  expect(errors).toEqual([]);
 });
