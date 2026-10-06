@@ -64,3 +64,24 @@ test('mobile layout keeps board and controls usable', async ({ page }) => {
   await page.screenshot({ path: 'test-results/screens/05-mobile.png' });
   expect(errors).toEqual([]);
 });
+
+test('real mouse clicks on the 3D board select and move pieces', async ({ page }) => {
+  const errors = collectErrors(page);
+  await openGame(page);
+  await page.waitForTimeout(800); // let the camera settle
+  const clickAt = async (square: string, turn = -1) => {
+    const pt = await page.evaluate(
+      ([sq, t]) => (window as any).ChessApp.Board3D.squareToScreen(0, sq, t),
+      [square, turn] as const
+    );
+    expect(pt).not.toBeNull();
+    await page.mouse.click(pt!.x, pt!.y);
+  };
+  await clickAt('e2');
+  await clickAt('e4');
+  await clickAt('g8');
+  await clickAt('f6');
+  const fen = await page.evaluate(() => (window as any).Game.getTimelineFen(0));
+  expect(fen.split(' ')[0]).toBe('rnbqkb1r/pppppppp/5n2/8/4P3/8/PPPP1PPP/RNBQKBNR');
+  expect(errors).toEqual([]);
+});

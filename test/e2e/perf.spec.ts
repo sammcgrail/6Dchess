@@ -3,7 +3,10 @@ import { collectErrors, move, openGame } from './helpers';
 
 async function gpuMemory(page: Page): Promise<{ geometries: number; textures: number }> {
   return page.evaluate(() => {
-    const info = (window as any).ChessApp.Board3D.renderer.info.memory;
+    const board3d = (window as any).ChessApp.Board3D;
+    // Render synchronously so every live texture/geometry has been uploaded before counting
+    board3d.renderer.render(board3d.scene, board3d.camera);
+    const info = board3d.renderer.info.memory;
     return { geometries: info.geometries, textures: info.textures };
   });
 }

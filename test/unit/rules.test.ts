@@ -6,6 +6,8 @@ import {
   planCrossTimelineMove,
   planTimeTravel,
   pieceMap,
+  isAttacked,
+  scoreMultiverseMove,
 } from '../../src/rules';
 import { parseFen } from '../../src/gameUtils';
 import type { Piece } from '../../src/types';
@@ -127,4 +129,23 @@ test('time travel departure cannot expose own king', () => {
 test('pawns and kings cannot time travel', () => {
   assert.equal(planTimeTravel(START, START, 'e2', WP).ok, false);
   assert.equal(planTimeTravel(START, START, 'e1', { type: 'k', color: 'w' }).ok, false);
+});
+
+test('isAttacked detects captures available to a color', () => {
+  const fen = '4k3/8/3p4/3p4/4N3/8/8/4K3 w - - 0 1';
+  assert.equal(isAttacked(fen, 'd6', 'w'), true); // knight e4 takes d6
+  assert.equal(isAttacked(fen, 'd5', 'w'), false);
+  assert.equal(isAttacked(fen, 'e4', 'b'), true); // pawn d5 takes e4
+  assert.equal(isAttacked(fen, 'h8', 'w'), false);
+});
+
+test('scoreMultiverseMove prefers mate, then check, and penalises hanging the piece', () => {
+  const WR: Piece = { type: 'r', color: 'w' };
+  // Rook arrives on a8 delivering back-rank mate (black king h8 boxed by its pawns)
+  const mate = scoreMultiverseMove('7k/8/8/8/8/8/8/R5K1 w - - 0 1', 'a1', 'R6k/6pp/8/8/8/8/8/6K1 b - - 1 1', 'a8', WR);
+  assert.equal(mate, 1000);
+  const quiet = scoreMultiverseMove('7k/8/8/8/8/8/8/R5K1 w - - 0 1', 'a1', '7k/6pp/8/8/8/8/8/R5K1 b - - 1 1', 'a1', WR);
+  const hanging = scoreMultiverseMove('7k/8/8/8/8/8/8/R5K1 w - - 0 1', 'a1', '7k/6pp/8/8/8/8/8/r5RK b - - 1 1'.replace('r5RK', '6RK').replace('6pp', '5p1p'), 'g1', WR);
+  assert.ok(mate > quiet);
+  assert.ok(quiet >= hanging);
 });

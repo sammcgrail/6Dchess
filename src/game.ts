@@ -30,8 +30,10 @@ import {
   canCrossTimelines,
   canTimeTravel,
   crossTimelineLandingSquares,
+  pieceMap,
   planCrossTimelineMove,
   planTimeTravel,
+  scoreMultiverseMove,
 } from './rules';
 import { stockfish } from './stockfish';
 
@@ -2129,7 +2131,6 @@ timelines - list timelines`,
     this.cpuStop();
     this.cpuGlobalTurn = 'w';
     this.clearSelection();
-    this.recentCrossTimelineMoves = [];
 
     Board3D.clearAll();
     this.timelines = {};
@@ -2180,14 +2181,6 @@ timelines - list timelines`,
   private cpuCrossTimelineChance = 0.75;  // Base chance for cross-timeline moves (0-1)
   private cpuTimeTravelChance = 0.5;      // Base chance for time travel moves (0-1)
 
-  // Cross-timeline loop detection - prevent ping-pong moves
-  private recentCrossTimelineMoves: Array<{
-    sourceTimelineId: number;
-    targetTimelineId: number;
-    square: string;
-    pieceType: string;
-  }> = [];
-  private crossTimelineHistorySize = 6;  // Track last 6 cross-timeline moves
 
   // Stockfish settings
   private cpuUseStockfish = true;  // Use Stockfish when available
@@ -2491,248 +2484,76 @@ timelines - list timelines`,
     return pool[Math.floor(Math.random() * pool.length)];
   }
 
-  /** Check if CPU has a time travel opportunity on this timeline */
+  /**
+   * Pick among scored multiverse candidates. Strong candidates (mate, check, rescuing a piece)
+   * are played with the slider's probability; purposeless ones only rarely, for variety.
+   */
+  private _cpuPickMultiverseMove<T extends { score: number; bias: number }>(candidates: T[], chance: number): T | null {
+    if (candidates.length === 0) return null;
+    candidates.sort((a, b) => b.score - a.score || b.bias - a.bias);
+    const best = candidates[0];
+    if (best.score >= 1000) return best; // forced win on another board: always take it
+    const strength = Math.min(1, Math.max(0, best.score) / 4);
+    const probability = chance * (0.08 + 0.92 * strength) * (0.5 + best.bias);
+    if (Math.random() >= probability) return null;
+    // Choose randomly among equally good candidates to avoid repetitive play
+    const top = candidates.filter((c) => c.score === best.score);
+    return top[Math.floor(Math.random() * top.length)];
+  }
+
+  /** Check if CPU has a worthwhile time travel move on this timeline */
   private _cpuCheckTimeTravel(tlId: number): TimeTravelTarget & { sourceSquare: Square; piece: Piece } | null {
     const tl = this.timelines[tlId];
     if (!tl) return null;
-
     const color = tl.chess.turn();
-    const board = tl.chess.board();
-    const isWhite = color === 'w';
-    const portalBiases = isWhite ? this.cpuWhitePortalBias : this.cpuBlackPortalBias;
+    const biases = color === 'w' ? this.cpuWhitePortalBias : this.cpuBlackPortalBias;
+    const sourceFen = tl.chess.fen();
+    const candidates: Array<{ target: TimeTravelTarget; sourceSquare: Square; piece: Piece; score: number; bias: number }> = [];
 
-    // Collect all portal opportunities with their biases
-    const opportunities: Array<{
-      target: TimeTravelTarget;
-      sourceSquare: Square;
-      piece: Piece;
-      bias: number;
-    }> = [];
-
-    // Find pieces that can time travel (q, r, b, n)
-    const timeTravelPieces = ['q', 'r', 'b', 'n'];
-    for (let r = 0; r < 8; r++) {
-      for (let c = 0; c < 8; c++) {
-        const piece = board[r][c];
-        if (piece && timeTravelPieces.includes(piece.type) && piece.color === color) {
-          const bias = portalBiases[piece.type] || 0;
-          if (bias <= 0) continue; // Skip if bias is 0
-
-          const square = (String.fromCharCode(97 + c) + (8 - r)) as Square;
-          const targets = this._getTimeTravelTargets(tlId, square, piece);
-
-          for (const target of targets) {
-            opportunities.push({ target, sourceSquare: square, piece, bias });
-          }
-        }
+    for (const [square, piece] of pieceMap(sourceFen)) {
+      if (piece.color !== color || !canTimeTravel(piece.type)) continue;
+      const bias = biases[piece.type] ?? 0;
+      if (bias <= 0) continue;
+      for (const target of this._getTimeTravelTargets(tlId, square, piece)) {
+        const snapshotFen = this._getSnapshotFen(tl.snapshots[tl.snapshots.length - 2 - target.targetTurnIndex]);
+        const plan = snapshotFen ? planTimeTravel(sourceFen, snapshotFen, square, piece) : null;
+        if (!plan || !plan.ok) continue;
+        const score = scoreMultiverseMove(sourceFen, square, plan.arrivalFen, square, piece, plan.captured);
+        candidates.push({ target, sourceSquare: square, piece, score, bias });
       }
     }
 
-    if (opportunities.length === 0 || Math.random() >= this.cpuTimeTravelChance) return null;
-
-    // For each opportunity, roll dice based on its bias
-    // Prefer captures, use highest-bias piece type
-    const captures = opportunities.filter(o => o.target.isCapture);
-    const pool = captures.length > 0 ? captures : opportunities;
-
-    // Sort by bias (highest first) and pick from top opportunities
-    pool.sort((a, b) => b.bias - a.bias);
-
-    // Pick the first opportunity that passes its bias check
-    for (const opp of pool) {
-      if (Math.random() < opp.bias) {
-        return { ...opp.target, sourceSquare: opp.sourceSquare, piece: opp.piece };
-      }
-    }
-
-    return null;
+    const pick = this._cpuPickMultiverseMove(candidates, this.cpuTimeTravelChance);
+    return pick ? { ...pick.target, sourceSquare: pick.sourceSquare, piece: pick.piece } : null;
   }
 
-  /**
-   * 5D-Aware CPU: Check for cross-timeline opportunities with strategic evaluation.
-   * Considers board evaluations across ALL timelines to decide when to cross.
-   */
-  private _cpuCheckCrossTimeline(tlId: number): { targetTimelineId: number; sourceSquare: Square; targetSquare: Square; piece: Piece; isCapture: boolean } | null {
+  /** Check if CPU has a worthwhile cross-timeline move from this timeline */
+  private _cpuCheckCrossTimeline(tlId: number): { targetTimelineId: number; sourceSquare: Square; targetSquare: Square; piece: Piece } | null {
     const tl = this.timelines[tlId];
-    if (!tl) return null;
-
-    const timelineIds = Object.keys(this.timelines).map(Number);
-    // Need at least 2 timelines to cross
-    if (timelineIds.length < 2) return null;
-
+    if (!tl || Object.keys(this.timelines).length < 2) return null;
     const color = tl.chess.turn();
-    const board = tl.chess.board();
-    const isWhite = color === 'w';
-    const portalBiases = isWhite ? this.cpuWhitePortalBias : this.cpuBlackPortalBias;
+    const biases = color === 'w' ? this.cpuWhitePortalBias : this.cpuBlackPortalBias;
+    const sourceFen = tl.chess.fen();
+    const sourceEval = this._evaluateMaterialBalance(tl.chess, color);
+    const candidates: Array<{ targetTimelineId: number; sourceSquare: Square; targetSquare: Square; piece: Piece; score: number; bias: number }> = [];
 
-    // 5D AWARENESS: Evaluate material balance on all timelines
-    const timelineEvals: Record<number, number> = {};
-    for (const id of timelineIds) {
-      const timeline = this.timelines[id];
-      if (timeline) {
-        timelineEvals[id] = this._evaluateMaterialBalance(timeline.chess, color);
+    for (const [square, piece] of pieceMap(sourceFen)) {
+      if (piece.color !== color || !canCrossTimelines(piece.type)) continue;
+      const bias = biases[piece.type] ?? 0.1;
+      if (bias <= 0) continue;
+      for (const target of this.getCrossTimelineTargets(tlId, square, piece)) {
+        const targetTl = this.timelines[target.targetTimelineId];
+        const plan = planCrossTimelineMove(sourceFen, targetTl.chess.fen(), square, target.targetSquare, piece);
+        if (!plan.ok) continue;
+        let score = scoreMultiverseMove(sourceFen, square, plan.targetFen, target.targetSquare, piece);
+        // Reinforce a board where we're behind using material from one where we're ahead
+        const targetEval = this._evaluateMaterialBalance(targetTl.chess, color);
+        if (sourceEval - targetEval >= 3 && score >= 0) score += 2;
+        candidates.push({ targetTimelineId: target.targetTimelineId, sourceSquare: square, targetSquare: target.targetSquare, piece, score, bias });
       }
     }
 
-    // Current board evaluation (positive = winning, negative = losing)
-    const sourceEval = timelineEvals[tlId] || 0;
-
-    // Collect all cross-timeline opportunities with strategic scoring
-    const opportunities: Array<{
-      targetTimelineId: number;
-      sourceSquare: Square;
-      targetSquare: Square;
-      piece: Piece;
-      isCapture: boolean;
-      bias: number;
-      strategicScore: number;
-    }> = [];
-
-    // Find pieces that can cross timelines (all except king)
-    for (let r = 0; r < 8; r++) {
-      for (let c = 0; c < 8; c++) {
-        const piece = board[r][c];
-        if (piece && piece.type !== 'k' && piece.color === color) {
-          const baseBias = portalBiases[piece.type] || 0.1;
-          if (baseBias <= 0) continue;
-
-          const sourceSquare = (String.fromCharCode(97 + c) + (8 - r)) as Square;
-          const targets = this.getCrossTimelineTargets(tlId, sourceSquare, piece);
-
-          for (const target of targets) {
-            const targetEval = timelineEvals[target.targetTimelineId] || 0;
-
-            // Strategic scoring based on 5D chess awareness:
-            // 1. If source board is LOSING and target is WINNING: HIGH priority (send reinforcements)
-            // 2. If source board is WINNING and target is LOSING: MEDIUM priority (press advantage)
-            // 3. Captures are always valuable
-            // 4. Sending to boards where we're already winning = build overwhelming force
-
-            let strategicScore = 0;
-
-            // Capture bonus (very valuable in multi-board chess)
-            if (target.isCapture) {
-              strategicScore += 3;
-            }
-
-            // Piece value for the crossing piece
-            const pieceValues: Record<string, number> = { p: 1, n: 3, b: 3, r: 5, q: 9 };
-            const pieceValue = pieceValues[piece.type] || 1;
-
-            // 5D tactical evaluation
-            if (sourceEval > 3 && targetEval < -1) {
-              // We're winning here, losing there - send reinforcements!
-              strategicScore += 4;
-            } else if (sourceEval < -1 && targetEval > 1) {
-              // We're losing here but winning there - escape valuable pieces
-              strategicScore += 2 + (pieceValue > 3 ? 2 : 0);
-            } else if (targetEval > 2) {
-              // Target board is favorable - build overwhelming force
-              strategicScore += 2;
-            }
-
-            // Bonus for high-value pieces crossing (queens, rooks)
-            if (pieceValue >= 5) {
-              strategicScore += 1;
-            }
-
-            opportunities.push({
-              targetTimelineId: target.targetTimelineId,
-              sourceSquare,
-              targetSquare: target.targetSquare,
-              piece,
-              isCapture: target.isCapture,
-              bias: baseBias,
-              strategicScore,
-            });
-          }
-        }
-      }
-    }
-
-    if (opportunities.length === 0) return null;
-
-    // Sort by strategic score (highest first), then by capture, then by bias
-    opportunities.sort((a, b) => {
-      if (b.strategicScore !== a.strategicScore) return b.strategicScore - a.strategicScore;
-      if (a.isCapture !== b.isCapture) return a.isCapture ? -1 : 1;
-      return b.bias - a.bias;
-    });
-
-    // 5D Aggressive mode: use slider-controlled cross-timeline chance
-    for (const opp of opportunities) {
-      // LOOP DETECTION: Check if this would be a ping-pong move
-      if (this._wouldBePingPongMove(tlId, opp.targetTimelineId, opp.targetSquare, opp.piece.type)) {
-        continue; // Skip this opportunity, try next
-      }
-
-      // Base chance from slider, plus strategic bonus
-      const baseChance = this.cpuCrossTimelineChance;
-      const strategicBonus = opp.strategicScore * 0.10; // Each strategic point adds 10%
-      const totalChance = Math.min(0.95, baseChance + strategicBonus);
-
-      if (Math.random() < totalChance) {
-
-        // Record this move in history for loop detection
-        this._recordCrossTimelineMove(tlId, opp.targetTimelineId, opp.targetSquare, opp.piece.type);
-
-        return {
-          targetTimelineId: opp.targetTimelineId,
-          sourceSquare: opp.sourceSquare,
-          targetSquare: opp.targetSquare,
-          piece: opp.piece,
-          isCapture: opp.isCapture,
-        };
-      }
-    }
-
-    return null;
-  }
-
-  /** Check if a cross-timeline move would create a ping-pong pattern */
-  private _wouldBePingPongMove(sourceId: number, targetId: number, square: string, pieceType: string): boolean {
-    // Look at recent moves involving this piece type from same square
-    const relevantMoves = this.recentCrossTimelineMoves.filter(
-      m => m.square === square && m.pieceType === pieceType
-    );
-
-    if (relevantMoves.length < 1) return false;
-
-    // Check if the last move was the reverse (target→source)
-    const lastMove = relevantMoves[relevantMoves.length - 1];
-    if (lastMove.sourceTimelineId === targetId && lastMove.targetTimelineId === sourceId) {
-      return true; // Would immediately reverse the last move
-    }
-
-    // Check for A→B→A pattern in last 2 moves
-    if (relevantMoves.length >= 2) {
-      const secondLast = relevantMoves[relevantMoves.length - 2];
-      if (
-        secondLast.sourceTimelineId === sourceId &&
-        secondLast.targetTimelineId === targetId &&
-        lastMove.sourceTimelineId === targetId &&
-        lastMove.targetTimelineId === sourceId
-      ) {
-        return true; // Would create A→B→A→B pattern
-      }
-    }
-
-    return false;
-  }
-
-  /** Record a cross-timeline move for loop detection */
-  private _recordCrossTimelineMove(sourceId: number, targetId: number, square: string, pieceType: string): void {
-    this.recentCrossTimelineMoves.push({
-      sourceTimelineId: sourceId,
-      targetTimelineId: targetId,
-      square,
-      pieceType,
-    });
-
-    // Keep history limited
-    while (this.recentCrossTimelineMoves.length > this.crossTimelineHistorySize) {
-      this.recentCrossTimelineMoves.shift();
-    }
+    return this._cpuPickMultiverseMove(candidates, this.cpuCrossTimelineChance);
   }
 
   /** Evaluate material balance for a position (positive = color is winning) */

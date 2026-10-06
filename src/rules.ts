@@ -195,3 +195,47 @@ export function planTimeTravel(
   if (!arrival.ok) return arrival;
   return { ok: true, sourceFen: departure.fen, arrivalFen: arrival.fen, captured: arrival.captured };
 }
+
+const PIECE_VALUES: Record<PieceType, number> = { p: 1, n: 3, b: 3, r: 5, q: 9, k: 0 };
+
+/** Material value of a piece type (king = 0) */
+export function pieceValue(type: PieceType): number {
+  return PIECE_VALUES[type];
+}
+
+/** True if `square` can be captured by `byColor` in this position */
+export function isAttacked(fen: string, square: Square, byColor: 'w' | 'b'): boolean {
+  const parts = fen.split(' ');
+  parts[1] = byColor;
+  parts[3] = '-';
+  const chess = new Chess();
+  if (!chess.load(parts.join(' '))) return false;
+  return (chess.moves({ verbose: true }) as Array<{ to: string }>).some((m) => m.to === square);
+}
+
+/**
+ * How promising a multiverse move is for the side making it, judged from the resulting
+ * position on the destination board: checkmate dominates, then check, then rescuing a
+ * piece that was under attack on its old board and is safe where it lands.
+ */
+export function scoreMultiverseMove(
+  departureFen: string,
+  fromSquare: Square,
+  arrivalFen: string,
+  toSquare: Square,
+  piece: Piece,
+  captured: Piece | null = null
+): number {
+  const opponent = piece.color === 'w' ? 'b' : 'w';
+  const arrival = new Chess();
+  if (!arrival.load(arrivalFen)) return -Infinity;
+  if (arrival.in_checkmate()) return 1000;
+  let score = captured ? pieceValue(captured.type) * 2 : 0;
+  if (arrival.in_check()) score += 4;
+  if (arrival.in_stalemate()) score -= 5;
+  const wasAttacked = isAttacked(departureFen, fromSquare, opponent);
+  const landsAttacked = isAttacked(arrivalFen, toSquare, opponent);
+  if (wasAttacked && !landsAttacked) score += 1 + pieceValue(piece.type) / 2;
+  if (landsAttacked) score -= pieceValue(piece.type);
+  return score;
+}
