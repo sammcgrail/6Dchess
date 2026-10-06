@@ -14,17 +14,26 @@
     </script>
     <title>6D Chess</title>
     <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>♟️</text></svg>">
-    <link rel="stylesheet" href="css/style.css?v=d4768dc841">
+    <link rel="stylesheet" href="css/style.css?v=fc431ae946">
 </head>
 <body>
     <div id="app">
         <div id="scene-container"></div>
         <div id="sidebar">
             <div id="sidebar-resize"></div>
-            <div id="status">White to move</div>
+            <header id="sidebar-header">
+                <div class="brand"><span class="brand-mark" aria-hidden="true">♞</span>6D Chess</div>
+                <span class="brand-tag">multiverse</span>
+            </header>
+            <div id="status" role="status" aria-live="polite">White to move</div>
             <div id="fen-display" title="Click to copy FEN">
                 <span id="fen-text"></span>
                 <div id="fen-tooltip"></div>
+            </div>
+            <div id="button-row">
+                <button id="reset">New Game</button>
+                <button id="cpu-toggle">Start CPU</button>
+                <button id="example-play" title="Run scripted example game">▶ Demo</button>
             </div>
             <div id="timeline-panel">
                 <div id="timeline-header">
@@ -35,16 +44,13 @@
                 <div id="timeline-resize"></div>
             </div>
             <div id="moves"></div>
-            <div id="button-row">
-                <button id="reset">New Game</button>
-                <button id="cpu-toggle">Start CPU</button>
-                <button id="example-play" title="Run scripted example game">▶ Demo</button>
-            </div>
+            <details id="cpu-settings">
+                <summary>CPU settings</summary>
             <div id="cpu-controls">
                 <!-- Basic Settings with Camera Toggle -->
                 <div class="cpu-section cpu-sliders-row">
                     <div class="cpu-sliders">
-                        <label>Speed: <input type="range" id="cpu-speed" min="100" max="2000" value="400" step="100"><span id="cpu-speed-value">1700ms</span></label>
+                        <label>Speed: <input type="range" id="cpu-speed" min="100" max="2000" value="1700" step="100"><span id="cpu-speed-value">400ms</span></label>
                         <label>Max Timelines: <input type="range" id="max-timelines" min="0" max="30" value="6" step="1"><span id="max-timelines-value">6</span></label>
                     </div>
                     <button id="cpu-camera-toggle" class="sidebar-icon-btn active" title="Toggle camera follow"><svg class="icon" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.997 4a2 2 0 0 1 1.76 1.05l.486.9A2 2 0 0 0 18.003 7H20a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2h1.997a2 2 0 0 0 1.759-1.048l.489-.904A2 2 0 0 1 10.004 4z"/><circle cx="12" cy="13" r="3"/></svg></button>
@@ -97,6 +103,7 @@
                     </div>
                 </div>
             </div>
+            </details>
             <div id="command-panel">
                 <input type="text" id="command-input" placeholder="e2e4 or fen or help">
                 <div id="command-output"></div>
@@ -138,6 +145,6 @@
     <script src="lib/OrbitControls.js"></script>
     <!-- Stockfish chess engine loads via Web Worker from lib/stockfish-worker.js -->
     <!-- TypeScript compiled bundle (with cache buster) -->
-    <script src="dist/bundle.js?v=206b8317ff"></script>
+    <script src="dist/bundle.js?v=19f07ae403"></script>
 </body>
 </html>

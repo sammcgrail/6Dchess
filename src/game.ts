@@ -1502,10 +1502,10 @@ timelines - list timelines`,
       });
     });
 
-    const sidebar = document.getElementById('sidebar');
-    if (sidebar) {
-      sidebar.appendChild(picker);
-    }
+    picker.setAttribute('role', 'dialog');
+    picker.setAttribute('aria-label', 'Choose promotion piece');
+    document.body.appendChild(picker);
+    (picker.querySelector('button') as HTMLButtonElement | null)?.focus();
   }
 
   /* -- Snapshot consistency validation -- */
@@ -1846,91 +1846,50 @@ timelines - list timelines`,
     const listEl = document.getElementById('timeline-list');
     if (!listEl) return;
     const colors = Board3D.TIMELINE_COLORS;
+    const timelines = Object.values(this.timelines).sort((a, b) => a.id - b.id);
 
-    // Fixed 6-slot grid: Main + 5 branches (minimum visible)
-    const MIN_SLOTS = 6;
-    const slotNames = ['Main', 'Branch 1', 'Branch 2', 'Branch 3', 'Branch 4', 'Branch 5'];
-
-    // Map existing timelines to slots (by ID, sorted)
-    const timelineIds = Object.keys(this.timelines).map(k => parseInt(k)).sort((a, b) => a - b);
-    const totalSlots = Math.max(MIN_SLOTS, timelineIds.length);
-
-    // Check if structure changed (new timelines added)
-    const structureKey = timelineIds.join(',') + '|' + totalSlots;
-    const structureChanged = structureKey !== this._lastTimelineStructure;
-
-    if (structureChanged) {
-      // Full rebuild needed
-      let html = '';
-      for (let slot = 0; slot < totalSlots; slot++) {
-        const tlId = timelineIds[slot];
-        const tl = tlId !== undefined ? this.timelines[tlId] : null;
-        const color = colors[slot % colors.length];
-        const hexColor = '#' + color.toString(16).padStart(6, '0');
-
-        if (tl) {
-          const isActive = tl.id === this.activeTimelineId;
-          const turnCount = tl.moveHistory.length;
-
-          html +=
-            '<div class="tl-item' +
-            (isActive ? ' active' : '') +
-            '" data-tl-id="' +
-            tl.id +
-            '">' +
-            '<span class="tl-dot" style="background:' +
-            hexColor +
-            '"></span>' +
-            '<span class="tl-label">' +
-            tl.name +
-            '</span>' +
-            '<span class="tl-turn">' +
-            turnCount +
-            '</span></div>';
-        } else {
-          const name = slot < slotNames.length ? slotNames[slot] : 'Branch ' + slot;
-          html +=
-            '<div class="tl-item empty">' +
-            '<span class="tl-dot" style="background:' +
-            hexColor +
-            '; opacity: 0.3"></span>' +
-            '<span class="tl-label">' +
-            name +
-            '</span>' +
-            '<span class="tl-turn">-</span></div>';
-        }
-      }
-
-      listEl.innerHTML = html;
+    // Rebuild only when the set of timelines changes; otherwise update in place (no scroll jump)
+    const structureKey = timelines.map((tl) => tl.id).join(',');
+    if (structureKey !== this._lastTimelineStructure) {
+      listEl.innerHTML = timelines
+        .map((tl) => {
+          const hex = '#' + colors[tl.id % colors.length].toString(16).padStart(6, '0');
+          return (
+            `<div class="tl-item" data-tl-id="${tl.id}" style="--tl-color:${hex}">` +
+            '<span class="tl-dot"></span>' +
+            `<span class="tl-label">${tl.name}</span>` +
+            '<span class="tl-state"></span>' +
+            '<span class="tl-turn"></span></div>'
+          );
+        })
+        .join('');
       this._lastTimelineStructure = structureKey;
-      // Click handlers are now managed via event delegation in _setupTimelinePanel()
-    } else {
-      // Just update active state and move counts in place (no scroll jump)
-      const items = listEl.querySelectorAll('.tl-item');
-      items.forEach((item) => {
-        const el = item as HTMLElement;
-        const tlId = el.dataset.tlId;
-        if (tlId === undefined) return; // empty slot
-
-        const id = parseInt(tlId);
-        const tl = this.timelines[id];
-        if (!tl) return;
-
-        // Update active class
-        if (id === this.activeTimelineId) {
-          el.classList.add('active');
-        } else {
-          el.classList.remove('active');
-        }
-
-        // Update move count
-        const turnEl = el.querySelector('.tl-turn');
-        if (turnEl) {
-          turnEl.textContent = String(tl.moveHistory.length);
-        }
-      });
     }
+
+    listEl.querySelectorAll<HTMLElement>('.tl-item').forEach((el) => {
+      const tl = this.timelines[Number(el.dataset.tlId)];
+      if (!tl) return;
+      el.classList.toggle('active', tl.id === this.activeTimelineId);
+      const chess = tl.chess;
+      const stateEl = el.querySelector('.tl-state') as HTMLElement;
+      let state = chess.turn() === 'w' ? 'to-move-w' : 'to-move-b';
+      let title = (chess.turn() === 'w' ? 'White' : 'Black') + ' to move';
+      if (chess.in_checkmate()) {
+        state = 'mate';
+        title = 'Checkmate — ' + (chess.turn() === 'w' ? 'Black' : 'White') + ' wins';
+      } else if (chess.in_draw() || chess.in_stalemate()) {
+        state = 'draw';
+        title = chess.in_stalemate() ? 'Stalemate' : 'Draw';
+      } else if (chess.in_check()) {
+        state += ' check';
+        title += ' (check)';
+      }
+      stateEl.className = 'tl-state ' + state;
+      el.title = `${tl.name}: ${title}`;
+      (el.querySelector('.tl-turn') as HTMLElement).textContent = String(tl.moveHistory.length);
+    });
   }
+
 
   /* -- Get branch points for a timeline -- */
   getBranchPoints(tlId: number): { childId: number; moveIndex: number; name: string }[] {
@@ -2066,19 +2025,19 @@ timelines - list timelines`,
     let winnerEmoji: string;
     if (stats.winner === 'white') {
       winnerText = 'White Wins!';
-      winnerEmoji = '⚪';
+      winnerEmoji = '♔';
     } else if (stats.winner === 'black') {
       winnerText = 'Black Wins!';
-      winnerEmoji = '⚫';
+      winnerEmoji = '♚';
     } else {
       winnerText = 'Draw!';
-      winnerEmoji = '🤝';
+      winnerEmoji = '½';
     }
 
     toast.innerHTML = `
       <div class="toast-header">
         <span class="toast-title">${winnerEmoji} ${winnerText}</span>
-        <button class="toast-close" onclick="this.parentElement.parentElement.remove()">×</button>
+        <button class="toast-close" aria-label="Close">×</button>
       </div>
       <div class="toast-body">
         <div class="toast-stat"><span>Timelines:</span> <strong>${stats.totalTimelines}</strong></div>
@@ -2089,6 +2048,7 @@ timelines - list timelines`,
       </div>
     `;
 
+    toast.querySelector('.toast-close')?.addEventListener('click', () => toast.remove());
     document.body.appendChild(toast);
 
     // Auto-fade after 10 seconds (but stays if user hovers)

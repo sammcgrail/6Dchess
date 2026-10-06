@@ -4,7 +4,7 @@
 import type {
   Scene, PerspectiveCamera, WebGLRenderer, Raycaster, Vector2, Vector3, Clock,
   Group, Mesh, Sprite, Points, Material, MeshStandardMaterial, SpriteMaterial,
-  Texture, Object3D, Curve, BufferGeometry
+  Texture, Object3D, Curve, BufferGeometry, Color as THREE_Color
 } from 'three';
 
 import type {
@@ -433,6 +433,8 @@ export class TimelineCol implements ITimelineCol {
   // Per-board clones of the base/trim materials so active/highlight glow affects only this board
   private baseMat: MeshStandardMaterial;
   private trimMat: MeshStandardMaterial;
+  private tint: THREE_Color;
+  private nameLabel: Sprite | null = null;
 
   // Performance: track previous board state for diff-based rendering
   // Store as map of "row,col" -> "type,color" to detect what changed
@@ -444,6 +446,7 @@ export class TimelineCol implements ITimelineCol {
     scene: Scene,
     id: number,
     xOffset: number,
+    tintColor: number,
     pieceChars: PieceCharMap,
     pieceTex: (char: string, isWhite: boolean) => Texture
   ) {
@@ -458,6 +461,9 @@ export class TimelineCol implements ITimelineCol {
     this.group.position.x = xOffset;
     this.baseMat = this.shared.boardBaseMat!.clone();
     this.trimMat = this.shared.boardTrimMat!.clone();
+    // Tint the frame with the timeline's color so boards match the sidebar list
+    this.tint = new THREE.Color(tintColor);
+    this.trimMat.color.lerp(this.tint, 0.55);
 
     this.moveLineGroup = new THREE.Group();
     this.interLayerGroup = new THREE.Group();
@@ -465,7 +471,9 @@ export class TimelineCol implements ITimelineCol {
     this.group.add(this.interLayerGroup);
 
     this._buildBoard();
+    this._addNameLabel(id === 0 ? 'Main' : 'Branch ' + id);
     scene.add(this.group);
+    this._applyBaseGlow();
 
     // Log timeline creation with position
   }
@@ -554,6 +562,31 @@ export class TimelineCol implements ITimelineCol {
     }
 
     this._addLabels();
+  }
+
+  /** Floating timeline name above the far edge of the board */
+  private _addNameLabel(name: string): void {
+    const canvas = document.createElement('canvas');
+    canvas.width = 512;
+    canvas.height = 96;
+    const ctx = canvas.getContext('2d')!;
+    const hex = '#' + this.tint.getHexString();
+    ctx.font = '600 52px system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.shadowColor = hex;
+    ctx.shadowBlur = 18;
+    ctx.fillStyle = hex;
+    ctx.fillText(name, 256, 50);
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = 'rgba(255,255,255,0.85)';
+    ctx.fillText(name, 256, 50);
+    const material = new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(canvas), transparent: true, depthWrite: false });
+    const sprite = new THREE.Sprite(material);
+    sprite.position.set(0, 0.6, -5.1);
+    sprite.scale.set(3.2, 0.6, 1);
+    this.nameLabel = sprite;
+    this.group.add(sprite);
   }
 
   private _addLabels(): void {
@@ -1223,7 +1256,9 @@ export class TimelineCol implements ITimelineCol {
   private _applyBaseGlow(): void {
     const glow = this._highlighted ? 0x446688 : this._active ? 0x2a2a5a : 0x000000;
     this.baseMat.emissive.setHex(glow);
-    this.trimMat.emissive.setHex(this._active ? 0x3a3a88 : 0x000000);
+    // Active board's frame glows in its timeline color
+    this.trimMat.emissive.copy(this.tint).multiplyScalar(this._active ? 0.55 : 0.12);
+    if (this.nameLabel) (this.nameLabel.material as SpriteMaterial).opacity = this._active ? 1 : 0.55;
   }
 
   private _boardGlowState: 'checkmate' | 'draw' | 'none' = 'none';
@@ -1283,6 +1318,10 @@ export class TimelineCol implements ITimelineCol {
     }
     this.baseMat.dispose();
     this.trimMat.dispose();
+    if (this.nameLabel) {
+      (this.nameLabel.material as SpriteMaterial).map?.dispose();
+      (this.nameLabel.material as SpriteMaterial).dispose();
+    }
     this.scene.remove(this.group);
   }
 
@@ -1700,6 +1739,7 @@ class Board3DManager implements IBoard3D {
       this.scene!,
       id,
       xOffset,
+      this.TIMELINE_COLORS[id % this.TIMELINE_COLORS.length],
       this.PIECE_CHARS,
       this._pieceTexture.bind(this)
     );
