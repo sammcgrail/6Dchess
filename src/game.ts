@@ -1061,7 +1061,8 @@ timelines - list timelines`,
     const tlId = info.timelineId;
 
     // While the CPU is mid-move, only allow camera focus (no piece interaction)
-    if (this.cpuEnabled && this.cpuMoveInProgress) {
+    // While watching CPU vs CPU, clicks only move the camera
+    if (this.getMode() === 'watch') {
       if (tlId !== this.activeTimelineId) {
         this.setActiveTimeline(tlId);
       } else {
@@ -1225,7 +1226,7 @@ timelines - list timelines`,
     const moveObj: { from: string; to: string; promotion?: PieceType } = { from: move.from, to: move.to };
     if (isPromotion) moveObj.promotion = promotionPiece || 'q';
 
-    const undoState = this.cpuMoveInProgress ? null : this.exportState();
+    const undoState = this.cpuCommitting ? null : this.exportState();
     const result = chess.move(moveObj);
     if (!result) {
       console.error('Invalid move:', moveObj);
@@ -1522,8 +1523,10 @@ timelines - list timelines`,
 
     // 4. Switch to the new timeline (respect camera follow setting for CPU mode)
     this.clearSelection();
-    const shouldFocus = !this.cpuEnabled || this.cpuCameraFollow;
-    this.setActiveTimeline(newId, shouldFocus);
+    // The CPU only takes over the view when it's playing both sides
+    if (!this.cpuCommitting || this.getMode() === 'watch') {
+      this.setActiveTimeline(newId, !this.cpuEnabled || this.cpuCameraFollow);
+    }
     this.renderTimeline(sourceTimelineId);
     this.renderTimeline(newId);
     sound.play('portal');
@@ -1625,7 +1628,7 @@ timelines - list timelines`,
   /** Remember the position before a move so it can be undone */
   private _pushUndo(): void {
     // Only human moves are undo points, so undo also reverts the CPU's reply
-    if (this.cpuMoveInProgress) return;
+    if (this.cpuCommitting) return;
     this.undoStack.push(this.exportState());
     if (this.undoStack.length > 100) this.undoStack.shift();
   }
@@ -2393,6 +2396,8 @@ timelines - list timelines`,
 
   // Lock held while a CPU move (including the engine search) is in progress
   private cpuMoveInProgress = false;
+  // True only while a CPU move is being applied (not while the engine thinks)
+  private cpuCommitting = false;
   // Incremented on start/stop/reset so stale async ticks can detect they are obsolete
   private cpuGeneration = 0;
   // Boards still to be played by the side to move in the current global turn (null = not started)
@@ -2441,6 +2446,13 @@ timelines - list timelines`,
       }
     }
     this._updateCpuUI();
+  }
+
+  private _restoreSelection(tlId: number, sq: string): void {
+    const tl = this.timelines[tlId];
+    const piece = tl?.chess.get(sq);
+    if (!tl || !piece || piece.color !== tl.chess.turn() || this._isCpuControlled(piece.color)) return;
+    this._handleBoardClick(tlId, sq);
   }
 
   /** True when the CPU is running and plays this color, so humans may not move it */
@@ -2556,7 +2568,12 @@ timelines - list timelines`,
       try {
         const tlId = this._cpuSelectBestTimeline(this.cpuTurnQueue);
         this.cpuTurnQueue = this.cpuTurnQueue.filter((id) => id !== tlId);
+        const humanSelection = this.selected !== null ? { tl: this.selectedTimelineId!, sq: this.selected } : null;
         const moved = await this._cpuMakeMove(tlId, generation);
+        // A CPU reply clears the selection; restore the human's piece with fresh targets
+        if (moved && humanSelection && generation === this.cpuGeneration && this.selected === null) {
+          this._restoreSelection(humanSelection.tl, humanSelection.sq);
+        }
         if (!moved && generation === this.cpuGeneration) {
           console.warn('[CPU] No move made on timeline', tlId);
         }
@@ -2666,7 +2683,8 @@ timelines - list timelines`,
     const isWhite = tl.chess.turn() === 'w';
     const capturePreference = isWhite ? this.cpuWhiteCapturePreference : this.cpuBlackCapturePreference;
 
-    if (this.activeTimelineId !== tlId) {
+    // When watching, follow the CPU from board to board; against a human, leave the view alone
+    if (this.getMode() === 'watch' && this.activeTimelineId !== tlId) {
       this.setActiveTimeline(tlId, this.cpuCameraFollow);
     }
 
@@ -2678,7 +2696,7 @@ timelines - list timelines`,
     // Time travel opportunity (if under timeline limit)
     if (Object.keys(this.timelines).length < this.maxTimelines) {
       const tt = this._cpuCheckTimeTravel(tlId);
-      if (tt && this._makeTimeTravelMove(tlId, tt.sourceSquare, tt.targetTurnIndex, tt.piece)) {
+      if (tt && this._asCpu(() => this._makeTimeTravelMove(tlId, tt.sourceSquare, tt.targetTurnIndex, tt.piece))) {
         this._flashCpuPreview(tlId, tt.sourceSquare, tt.sourceSquare, isWhite, true);
         return true;
       }
@@ -2686,7 +2704,7 @@ timelines - list timelines`,
 
     // Cross-timeline opportunity
     const cross = this._cpuCheckCrossTimeline(tlId);
-    if (cross && this.makeCrossTimelineMove(tlId, cross.targetTimelineId, cross.sourceSquare, cross.targetSquare, cross.piece)) {
+    if (cross && this._asCpu(() => this.makeCrossTimelineMove(tlId, cross.targetTimelineId, cross.sourceSquare, cross.targetSquare, cross.piece))) {
       this._flashCpuPreview(tlId, cross.sourceSquare, cross.targetSquare, isWhite, false);
       return true;
     }
@@ -2698,9 +2716,19 @@ timelines - list timelines`,
     if (!move || generation !== this.cpuGeneration || !this.timelines[tlId] || tl.chess.fen() !== fen) {
       return false;
     }
-    if (!this.makeMove(tlId, move, move.promotion)) return false;
+    if (!this._asCpu(() => this.makeMove(tlId, move, move.promotion))) return false;
     this._flashCpuPreview(tlId, move.from, move.to, isWhite, false);
     return true;
+  }
+
+  /** Apply a move on the CPU's behalf (not an undo point, doesn't steal the view from a human) */
+  private _asCpu<T>(apply: () => T): T {
+    this.cpuCommitting = true;
+    try {
+      return apply();
+    } finally {
+      this.cpuCommitting = false;
+    }
   }
 
   private _flashCpuPreview(tlId: number, from: string, to: string, isWhite: boolean, isTimeTravel: boolean): void {
