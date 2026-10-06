@@ -157,3 +157,45 @@ test('clicking a move reviews that position; clicking the board returns to the p
   expect((await boards(page))[0].moveCount).toBe(4);
   expect(errors).toEqual([]);
 });
+
+/** Piece placement (FEN first field) of what a board's 3D column currently draws */
+async function renderedPlacement(page: import('@playwright/test').Page, tlId: number): Promise<string> {
+  return page.evaluate((id) => {
+    const state: Map<string, string> = (window as any).ChessApp.Board3D.getTimeline(id)._prevBoardState;
+    const rows: string[] = [];
+    for (let r = 0; r < 8; r++) {
+      let row = '';
+      let empty = 0;
+      for (let c = 0; c < 8; c++) {
+        const p = state.get(`${r},${c}`);
+        if (!p) { empty++; continue; }
+        if (empty) { row += empty; empty = 0; }
+        const [type, color] = p.split(',');
+        row += color === 'w' ? type.toUpperCase() : type;
+      }
+      rows.push(row + (empty ? empty : ''));
+    }
+    return rows.join('/');
+  }, tlId);
+}
+
+test('switching boards while reviewing returns the reviewed board to the present', async ({ page }) => {
+  const errors = collectErrors(page);
+  await openGame(page);
+  await move(page, 0, 'g1', 'f3');
+  await move(page, 0, 'g8', 'f6');
+  await clickSquare(page, 0, 'f3');
+  await clickSquare(page, 0, 'f3', 1); // Branch 1 is created and becomes active
+  await page.locator('#timeline-list .tl-item[data-tl-id="0"]').click();
+
+  // Review Main after its first move: the board shows the past
+  await page.locator('#moves .move[data-ply="1"]').click();
+  const present = (await boards(page)).find((b) => b.timelineId === 0)!.currentFen.split(' ')[0];
+  expect(await renderedPlacement(page, 0)).not.toBe(present);
+
+  // Switch boards: state is back at the present, so Main must draw the present again
+  await page.locator('#timeline-list .tl-item[data-tl-id="1"]').click();
+  await expect(page.locator('#timeline-list .tl-item.active')).toContainText('Branch 1');
+  expect(await renderedPlacement(page, 0)).toBe(present);
+  expect(errors).toEqual([]);
+});
