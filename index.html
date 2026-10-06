@@ -14,11 +14,17 @@
     </script>
     <title>6D Chess</title>
     <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>♟️</text></svg>">
-    <link rel="stylesheet" href="css/style.css?v=8612108bb8">
+    <link rel="stylesheet" href="css/style.css?v=e78f143fc8">
 </head>
 <body>
     <div id="app">
-        <div id="scene-container"></div>
+        <div id="scene-container">
+            <div id="view-toolbar" role="toolbar" aria-label="View">
+                <button id="2d-mode-toggle" class="sidebar-icon-btn" title="Toggle 2D top-down view (T)" aria-label="Toggle 2D view"><svg class="icon" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z"/><path d="m3.3 7 8.7 5 8.7-5"/><path d="M12 22V12"/></svg></button>
+                <button id="fit-view" class="sidebar-icon-btn" title="Show all boards (X)" aria-label="Show all boards"><svg class="icon" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M21 8V5a2 2 0 0 0-2-2h-3"/><path d="M3 16v3a2 2 0 0 0 2 2h3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/></svg></button>
+                <button id="cpu-camera-toggle" class="sidebar-icon-btn active" title="Camera follows CPU moves" aria-label="Camera follows CPU moves"><svg class="icon" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.997 4a2 2 0 0 1 1.76 1.05l.486.9A2 2 0 0 0 18.003 7H20a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2h1.997a2 2 0 0 0 1.759-1.048l.489-.904A2 2 0 0 1 10.004 4z"/><circle cx="12" cy="13" r="3"/></svg></button>
+            </div>
+        </div>
         <div id="sidebar">
             <div id="sidebar-resize"></div>
             <header id="sidebar-header">
@@ -54,8 +60,6 @@
                         <label>Speed: <input type="range" id="cpu-speed" min="100" max="2000" value="1700" step="100"><span id="cpu-speed-value">400ms</span></label>
                         <label>Max Timelines: <input type="range" id="max-timelines" min="0" max="30" value="6" step="1"><span id="max-timelines-value">6</span></label>
                     </div>
-                    <button id="cpu-camera-toggle" class="sidebar-icon-btn active" title="Toggle camera follow"><svg class="icon" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.997 4a2 2 0 0 1 1.76 1.05l.486.9A2 2 0 0 0 18.003 7H20a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2h1.997a2 2 0 0 0 1.759-1.048l.489-.904A2 2 0 0 1 10.004 4z"/><circle cx="12" cy="13" r="3"/></svg></button>
-                    <button id="2d-mode-toggle" class="sidebar-icon-btn" title="Toggle 2D top-down view (T)"><svg class="icon" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z"/><path d="m3.3 7 8.7 5 8.7-5"/><path d="M12 22V12"/></svg></button>
                 </div>
 
                 <!-- Stockfish Engine -->
@@ -148,6 +152,6 @@
     <script src="lib/OrbitControls.js"></script>
     <!-- Stockfish chess engine loads via Web Worker from lib/stockfish-worker.js -->
     <!-- TypeScript compiled bundle (with cache buster) -->
-    <script src="dist/bundle.js?v=8203720310"></script>
+    <script src="dist/bundle.js?v=126112c599"></script>
 </body>
 </html>

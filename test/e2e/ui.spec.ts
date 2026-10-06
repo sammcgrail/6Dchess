@@ -100,3 +100,30 @@ test('sound toggle persists across reloads', async ({ page }) => {
   await move(page, 0, 'e2', 'e4');
   expect(errors).toEqual([]);
 });
+
+test('2D mode keeps every board on screen while playing', async ({ page }) => {
+  const errors = collectErrors(page);
+  await openGame(page);
+  await move(page, 0, 'g1', 'f3');
+  await move(page, 0, 'g8', 'f6');
+  await clickSquare(page, 0, 'f3');
+  await clickSquare(page, 0, 'f3', 1); // time travel -> Branch 1, starts a camera focus animation
+  await page.locator('[id="2d-mode-toggle"]').click();
+  // Playing on a board in 2D used to pan the camera to that board's 3D position
+  await move(page, 1, 'e7', 'e5');
+  await move(page, 0, 'e7', 'e5');
+  await page.waitForTimeout(800);
+  // The 2D grid is centered on the origin; playing must not pan it away
+  const target = await page.evaluate(() => (window as any).ChessApp.Board3D.controls.target.toArray());
+  expect(Math.hypot(target[0], target[2])).toBeLessThan(0.01);
+  const canvas = (await page.locator('#scene-container canvas').boundingBox())!;
+  for (const tl of [0, 1]) {
+    const pt = await page.evaluate((id) => (window as any).ChessApp.Board3D.squareToScreen(id, 'e4'), tl);
+    expect(pt.x).toBeGreaterThan(canvas.x);
+    expect(pt.x).toBeLessThan(canvas.x + canvas.width);
+    expect(pt.y).toBeGreaterThan(canvas.y);
+    expect(pt.y).toBeLessThan(canvas.y + canvas.height);
+  }
+  await page.screenshot({ path: 'test-results/screens/06-2d-mode.png' });
+  expect(errors).toEqual([]);
+});

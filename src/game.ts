@@ -459,6 +459,8 @@ class GameManager {
       });
     }
 
+    document.getElementById('fit-view')?.addEventListener('click', () => Board3D.zoomOutShowAll());
+
     const cameraToggle = document.getElementById('cpu-camera-toggle');
     if (cameraToggle) {
       cameraToggle.addEventListener('click', () => {

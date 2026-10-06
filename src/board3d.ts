@@ -1298,6 +1298,12 @@ export class TimelineCol implements ITimelineCol {
     // Keep move line group visible (blue/orange move indicators on board)
     // this.moveLineGroup stays visible
 
+    // In the tight 2D grid the name sits just above the board edge
+    if (this.nameLabel) {
+      this.nameLabel.position.set(0, 0.6, enabled ? -4.75 : -5.1);
+      this.nameLabel.scale.set(enabled ? 2.6 : 3.2, enabled ? 0.49 : 0.6, 1);
+    }
+
     // Larger pieces in the top-down 2D view
     const targetScale = enabled ? TimelineCol.PIECE_SCALE_2D : TimelineCol.PIECE_SCALE_3D;
     for (const sprite of this._spriteMap.values()) {
@@ -1906,6 +1912,8 @@ class Board3DManager implements IBoard3D {
   focusTimeline(id: number, animate: boolean): void {
     const col = this.timelineCols[id];
     if (!col || !this.controls || !this.camera || !this._clock) return;
+    // The 2D grid already shows every board; panning would push it off screen
+    if (this._is2DMode) return;
 
     const targetX = col.xOffset;
     const currentTarget = this.controls.target.clone();
@@ -2901,6 +2909,7 @@ class Board3DManager implements IBoard3D {
   set2DMode(enabled: boolean): void {
     if (!this.camera || !this.controls) return;
     if (this._is2DMode === enabled) return;
+    this._focusTween = undefined;
 
     if (enabled) {
       // Save current camera state
@@ -2916,6 +2925,7 @@ class Board3DManager implements IBoard3D {
       this._pre2DBoardPositions.clear();
       const boardSize = 8;
       const gridSpacing = 9; // Tight spacing for 2D grid (just 1 unit gap between boards)
+      const rowSpacing = 10; // Extra room between rows for the board name labels
       const numBoards = timelineIds.length;
 
       // Calculate grid dimensions (prefer wider grids)
@@ -2924,7 +2934,7 @@ class Board3DManager implements IBoard3D {
 
       // Grid dimensions
       const gridWidth = (cols - 1) * gridSpacing;
-      const gridDepth = (rows - 1) * gridSpacing;
+      const gridDepth = (rows - 1) * rowSpacing;
 
       // Sort timelines by original xOffset for consistent ordering
       const sortedIds = timelineIds.sort((a, b) => {
@@ -2947,7 +2957,7 @@ class Board3DManager implements IBoard3D {
 
         // Center the grid
         const newX = gridCol * gridSpacing - gridWidth / 2;
-        const newZ = gridRow * gridSpacing - gridDepth / 2;
+        const newZ = gridRow * rowSpacing - gridDepth / 2;
 
         // Update position
         col.xOffset = newX;
