@@ -24,7 +24,7 @@ const config = {
   entryPoints: ['src/main.ts'],
   bundle: true,
   outfile: 'dist/bundle.js',
-  sourcemap: true,
+  sourcemap: false, // no public source maps (security review 2026-10-27 #18)
   target: 'es2020',
   format: 'iife',
   globalName: 'ChessApp',
